@@ -20,8 +20,7 @@ import pandas as pd
 
 from src.core.processor import ProductProcessor, ProcessorConfig, InputProduct, ProductResult
 from src.core.cache import ProductCache
-from src.api.allegro import AllegroClient, AllegroAPIError
-from src.api.scraper import ScrapeDoClient, ScraperError, search_allegro_by_ean
+from src.api.scraper import ScrapeDoClient, search_allegro_by_ean
 
 
 st.set_page_config(
@@ -65,8 +64,7 @@ def init_session_state():
         st.session_state.job_index = 0
     if "current_ean" not in st.session_state:
         st.session_state.current_ean = None
-    if "data_source" not in st.session_state:
-        st.session_state.data_source = "scrape_do"
+    st.session_state.data_source = "scrape_do"
     if "last_autosave_path" not in st.session_state:
         st.session_state.last_autosave_path = None
     if "analyze_products" not in st.session_state:
@@ -123,102 +121,33 @@ def df_to_input_products(df: pd.DataFrame) -> list[InputProduct]:
     return products
 
 
-def build_data_fetcher(source: str):
+def build_data_fetcher():
     """
-    Tworzy data_fetcher dla ProductProcessor.
-    scrape_do reuse'uje ScrapeDoClient z sesji (spójne kredyty).
-    Zwraca None i pokazuje błąd przy braku konfiguracji.
-    Błędy API są propagowane (status=error), nie maskowane jako pusta lista.
+    Tworzy data_fetcher przez scrape.do (jedyny tryb).
+    Reuse'uje ScrapeDoClient z sesji (spójne kredyty).
     """
-    from src.core.request_log import log_request
+    client = get_scrape_client()
+    if client is None:
+        st.error("Brak tokena scrape.do w .env — nie można uruchomić scrapowania.")
+        return None
 
-    if source == "scrape_do":
-        client = get_scrape_client()
-        if client is None:
-            st.error("Brak tokena scrape.do w .env — nie można uruchomić scrapowania.")
-            return None
+    def fetch_scrape(ean: str) -> list[dict]:
+        offers = search_allegro_by_ean(ean, client, render=True)
+        return [
+            {
+                "offer_id": o.offer_id,
+                "title": o.title,
+                "price": o.price,
+                "currency": o.currency,
+                "seller_name": o.seller_name,
+                "buyers_count": o.buyers_count,
+                "url": o.url,
+                "is_smart": o.is_smart,
+            }
+            for o in offers
+        ]
 
-        def fetch_scrape(ean: str) -> list[dict]:
-            offers = search_allegro_by_ean(ean, client, render=True)
-            return [
-                {
-                    "offer_id": o.offer_id,
-                    "title": o.title,
-                    "price": o.price,
-                    "currency": o.currency,
-                    "seller_name": o.seller_name,
-                    "buyers_count": o.buyers_count,
-                    "url": o.url,
-                    "is_smart": o.is_smart,
-                }
-                for o in offers
-            ]
-
-        return fetch_scrape
-
-    if source == "api":
-        try:
-            allegro = AllegroClient()
-            allegro.get_token()
-        except Exception as e:
-            st.error(f"API Allegro niedostępne: {e}")
-            return None
-
-        def fetch_api(ean: str) -> list[dict]:
-            url = f"{allegro.API_URL}/offers/listing"
-            try:
-                result = allegro.search_offers(phrase=ean)
-                items = result.get("items", {})
-                offers = items.get("promoted", []) + items.get("regular", [])
-                mapped = [
-                    {
-                        "offer_id": o.get("id", ""),
-                        "title": o.get("name", ""),
-                        "price": float(
-                            o.get("sellingMode", {}).get("price", {}).get("amount", 0)
-                        ),
-                        "currency": o.get("sellingMode", {})
-                        .get("price", {})
-                        .get("currency", "PLN"),
-                        "seller_name": o.get("seller", {}).get("login", ""),
-                        "buyers_count": o.get("popularity", {}).get("soldCount"),
-                        "url": f"https://allegro.pl/oferta/{o.get('id', '')}",
-                        "is_smart": o.get("delivery", {}).get("smart", False),
-                    }
-                    for o in offers
-                ]
-                log_request(
-                    source="api",
-                    url=url,
-                    code=ean,
-                    http_status=200,
-                    error=None,
-                    response_text=json.dumps(result, ensure_ascii=False)[:4000],
-                    offers_parsed=len(mapped),
-                    offer_titles=[m["title"] for m in mapped if m.get("title")],
-                    extra={"phrase": ean},
-                    save_html_on_empty=False,
-                )
-                return mapped
-            except AllegroAPIError as e:
-                log_request(
-                    source="api",
-                    url=url,
-                    code=ean,
-                    http_status=e.status_code,
-                    error=str(e),
-                    response_text=None,
-                    offers_parsed=0,
-                    offer_titles=[],
-                    extra={"code": e.code, "phrase": ean},
-                    save_html_on_empty=False,
-                )
-                raise
-
-        return fetch_api
-
-    st.error(f"Nieznane źródło danych: {source}")
-    return None
+    return fetch_scrape
 
 
 def _clamp_range(start: int, end: int, n_total: int) -> tuple[int, int]:
@@ -323,20 +252,10 @@ def sidebar_config():
         delay_seconds=float(delay)
     )
     
-    # Źródło danych
     st.sidebar.subheader("Źródło danych")
-    source_options = ["scrape_do", "api"]
-    current = st.session_state.get("data_source", "scrape_do")
-    if current not in source_options:
-        current = "scrape_do"
-    source = st.sidebar.selectbox(
-        "Wybierz źródło",
-        source_options,
-        index=source_options.index(current),
-        help="scrape_do = listing jak w przeglądarce; api = API Allegro (wymaga weryfikacji)",
-    )
-    st.session_state.data_source = source
-    
+    st.sidebar.caption("Zablokowane: **scrape.do** (listing Allegro jak w przeglądarce).")
+    st.session_state.data_source = "scrape_do"
+
     # Cache stats
     st.sidebar.subheader("📦 Cache")
     cache = ProductCache()
@@ -1082,10 +1001,7 @@ def scrape_tab() -> None:
     selected_df = None
     if df is not None and len(df) > 0:
         selected_df = range_section(df)
-        if st.session_state.data_source == "scrape_do":
-            can_start = cost_estimate_section(len(selected_df))
-        else:
-            cost_estimate_section(len(selected_df))
+        can_start = cost_estimate_section(len(selected_df))
 
     start_btn, pause_btn, resume_btn, stop_btn = control_section()
 
@@ -1094,8 +1010,7 @@ def scrape_tab() -> None:
         if not products:
             st.error("Brak produktów z kodem w wybranym zakresie.")
         else:
-            source = st.session_state.get("data_source", "scrape_do")
-            fetcher = build_data_fetcher(source)
+            fetcher = build_data_fetcher()
             if fetcher is not None:
                 st.session_state.processor = ProductProcessor(
                     config=st.session_state.config,
@@ -1111,12 +1026,11 @@ def scrape_tab() -> None:
                 st.session_state.running = True
                 st.session_state.selected_df = selected_df
                 st.session_state.last_autosave_path = None
-                if source == "scrape_do":
-                    refresh_credits_info()
+                refresh_credits_info()
                 st.info(
                     f"Przetwarzanie wierszy "
                     f"{st.session_state.range_start}–{st.session_state.range_end} "
-                    f"({len(products)} produktów, źródło: `{source}`)."
+                    f"({len(products)} produktów, źródło: scrape.do)."
                 )
     elif start_btn and selected_df is None:
         st.error("Najpierw wczytaj plik CSV.")
@@ -1171,11 +1085,11 @@ def main():
     st.sidebar.divider()
     st.sidebar.caption("""
     **Allegro Price Monitor**  
-    Wersja 1.3
+    Wersja 1.3 · źródło: scrape.do
     
     Tryb konsolowy:
     ```
-    python src/main.py run -i plik.csv -s scrape_do
+    python src/main.py run -i plik.csv
     ```
     """)
 

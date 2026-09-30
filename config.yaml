@@ -13,8 +13,7 @@ rate_limit:
   delay_between_requests: 6  # sekundy miedzy requestami
 
 data_source:
-  primary: "api"    # api / scrape_do / scraper
-  fallback: "scrape_do"
+  primary: "scrape_do"  # jedyne zrodlo (API Allegro listing niedostepne)
 
 output:
   format: "json"    # json / csv
