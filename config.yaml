@@ -1,0 +1,21 @@
+price_threshold:
+  min_markup: 0.12  # 12%
+  max_markup: 0.15  # 15%
+
+sales_threshold:
+  min_buyers: 1     # minimum "X osob kupilo"
+
+cache:
+  ttl_days: 7       # waznosc danych w dniach
+
+rate_limit:
+  requests_per_minute: 10  # bezpieczny limit
+  delay_between_requests: 6  # sekundy miedzy requestami
+
+data_source:
+  primary: "api"    # api / scrape_do / scraper
+  fallback: "scrape_do"
+
+output:
+  format: "json"    # json / csv
+  versioned: true   # czy dodawac date do nazwy pliku
