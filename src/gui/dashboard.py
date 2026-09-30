@@ -668,6 +668,9 @@ def progress_section():
 
     results = st.session_state.results
     if results:
+        from src.core.results_io import count_matching_offers
+
+        cfg = st.session_state.config
         col1, col2, col3, col4 = st.columns(4)
 
         with col1:
@@ -676,7 +679,16 @@ def progress_section():
             found = sum(1 for r in results if r.get("found_on_allegro"))
             st.metric("Znalezionych", found)
         with col3:
-            matching = sum(1 for r in results if r.get("matching_offers"))
+            matching = sum(
+                1
+                for r in results
+                if count_matching_offers(
+                    r,
+                    min_markup=cfg.min_markup,
+                    max_markup=cfg.max_markup,
+                    min_buyers=cfg.min_buyers,
+                )
+            )
             st.metric("Z pasującymi", matching)
         with col4:
             errors = sum(1 for r in results if r.get("status") == "error")
@@ -693,9 +705,9 @@ def results_columns_help(*, key: str = "results_columns_help") -> None:
 - ❌ **error** — błąd zapytania (API, scrape.do, sieć); treść w kolumnie **Błąd**.
 - ⏳ **pending** — jeszcze nie sprawdzone.
 
-**Pasujące** — ile ofert spełnia *oba* filtry ze sidebara naraz:
-marża min–max względem Twojej ceny **oraz** min. kupujących.
-`0` często = cena poza progiem (np. +19% przy limicie 12–15%) albo brak `buyers_count`.
+**Pasujące** — liczone na żywo wg filtrów (sidebar): marża min–max względem Twojej ceny
+oraz min. kupujących. Przy domyślnych 0–50% i min. kupujących = 0 zwykle = wszystkie oferty.
+Gdy zacieśnisz filtry, liczba spada. Min. kupujących = 0 → oferty bez `buyers_count` też liczą się.
 
 **Błąd** — puste = OK. Komunikat tylko przy statusie error.
 
@@ -723,16 +735,28 @@ def results_section():
         results_columns_help(key="scrape_results_help")
 
     results = st.session_state.results
+    cfg = st.session_state.config
+    filter_kw = dict(
+        min_markup=cfg.min_markup,
+        max_markup=cfg.max_markup,
+        min_buyers=cfg.min_buyers,
+    )
 
-    rows = [summary_row(r) for r in results]
+    rows = [summary_row(r, **filter_kw) for r in results]
     df = pd.DataFrame(rows)
+
+    st.caption(
+        f"Pasujące wg sidebara: marża {cfg.min_markup*100:.0f}–{cfg.max_markup*100:.0f}%, "
+        f"min. kupujących = {cfg.min_buyers} "
+        f"(zmiana filtrów odświeża kolumnę bez ponownego scrapu)."
+    )
 
     filter_col1, filter_col2 = st.columns(2)
     with filter_col1:
         show_only_matching = st.checkbox(
-            "Tylko z pasującymi (wg filtrów scrapa)",
+            "Tylko z pasującymi (wg filtrów sidebara)",
             key="scrape_only_matching",
-            help="Pokazuje wiersze, gdzie Pasujące > 0 (filtry marży i kupujących z sidebara).",
+            help="Pokazuje wiersze, gdzie Pasujące > 0 (aktualne filtry marży i kupujących).",
         )
     with filter_col2:
         show_only_found = st.checkbox(
@@ -751,10 +775,11 @@ def results_section():
 
     with st.expander("Szczegóły ofert (wszystkie ceny)", expanded=False):
         for r in results:
-            stats = offer_stats(r)
+            stats = offer_stats(r, **filter_kw)
             code = r.get("ean")
             st.markdown(
                 f"**`{code}`** — ofert: {stats['offers_count']}, "
+                f"pasujących: {stats['matching_count']}, "
                 f"cena {stats['min_price']}–{stats['max_price']}"
             )
             if stats["offers"]:
@@ -929,7 +954,17 @@ def analyze_section():
     with a_r:
         results_columns_help(key="analyze_results_help")
 
-    summary_df = pd.DataFrame([summary_row(p) for p in filtered])
+    summary_df = pd.DataFrame(
+        [
+            summary_row(
+                p,
+                min_markup=float(markup_range[0]) / 100.0,
+                max_markup=float(markup_range[1]) / 100.0,
+                min_buyers=int(min_buyers),
+            )
+            for p in filtered
+        ]
+    )
     st.dataframe(summary_df, width="stretch")
 
     flat = flatten_offers(filtered)
@@ -1019,6 +1054,7 @@ def process_job_tick() -> None:
     st.session_state.current_ean = product.ean
     st.caption(f"Pobieranie danych dla `{product.ean}`…")
 
+    processor.config = st.session_state.config
     result = processor.process_single(product)
     st.session_state.results.append(result.to_dict())
     st.session_state.job_index = idx + 1

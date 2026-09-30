@@ -1,9 +1,9 @@
 price_threshold:
-  min_markup: 0.12  # 12%
-  max_markup: 0.15  # 15%
+  min_markup: 0.0   # 0% — zbieramy szeroko; zawężanie w Analizie
+  max_markup: 0.50  # 50%
 
 sales_threshold:
-  min_buyers: 1     # minimum "X osob kupilo"
+  min_buyers: 0     # 0 = nie wymagaj liczby kupujących (null też OK)
 
 cache:
   ttl_days: 7       # waznosc danych w dniach

@@ -66,9 +66,9 @@ class ProductResult:
 
 @dataclass
 class ProcessorConfig:
-    min_markup: float = 0.12
-    max_markup: float = 0.15
-    min_buyers: int = 1
+    min_markup: float = 0.0
+    max_markup: float = 0.50
+    min_buyers: int = 0
     ttl_days: int = 7
     delay_seconds: float = 6.0
     
@@ -78,9 +78,9 @@ class ProcessorConfig:
             with open(path, "r", encoding="utf-8") as f:
                 config = yaml.safe_load(f)
             return cls(
-                min_markup=config.get("price_threshold", {}).get("min_markup", 0.12),
-                max_markup=config.get("price_threshold", {}).get("max_markup", 0.15),
-                min_buyers=config.get("sales_threshold", {}).get("min_buyers", 1),
+                min_markup=config.get("price_threshold", {}).get("min_markup", 0.0),
+                max_markup=config.get("price_threshold", {}).get("max_markup", 0.50),
+                min_buyers=config.get("sales_threshold", {}).get("min_buyers", 0),
                 ttl_days=config.get("cache", {}).get("ttl_days", 7),
                 delay_seconds=config.get("rate_limit", {}).get("delay_between_requests", 6),
             )
@@ -127,13 +127,15 @@ class ProductProcessor:
         return products
     
     def check_price_match(self, my_price: float, allegro_price: float) -> bool:
-        """Sprawdza czy cena Allegro jest w przedziale 12-15% wyzszym."""
+        """Sprawdza czy cena Allegro jest w przedziale marży (config)."""
         min_price = my_price * (1 + self.config.min_markup)
         max_price = my_price * (1 + self.config.max_markup)
         return min_price <= allegro_price <= max_price
     
     def check_sales(self, buyers_count: Optional[int]) -> bool:
-        """Sprawdza czy produkt sie sprzedaje."""
+        """Sprawdza czy produkt sie sprzedaje. min_buyers<=0 = bez wymogu (null OK)."""
+        if self.config.min_buyers <= 0:
+            return True
         if buyers_count is None:
             return False
         return buyers_count >= self.config.min_buyers
