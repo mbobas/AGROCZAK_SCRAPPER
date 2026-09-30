@@ -24,6 +24,7 @@ console = Console()
 
 def create_data_fetcher(mode: str = "api"):
     """Tworzy funkcje do pobierania danych w zaleznosci od trybu."""
+    from src.core.request_log import log_request
     
     if mode == "api":
         try:
@@ -31,12 +32,13 @@ def create_data_fetcher(mode: str = "api"):
             client.get_token()
             
             def fetch_api(ean: str):
+                url = f"{client.API_URL}/offers/listing"
                 try:
                     result = client.search_offers(phrase=ean)
                     items = result.get("items", {})
                     offers = items.get("promoted", []) + items.get("regular", [])
                     
-                    return [{
+                    mapped = [{
                         "offer_id": o.get("id", ""),
                         "title": o.get("name", ""),
                         "price": float(o.get("sellingMode", {}).get("price", {}).get("amount", 0)),
@@ -46,8 +48,29 @@ def create_data_fetcher(mode: str = "api"):
                         "url": f"https://allegro.pl/oferta/{o.get('id', '')}",
                         "is_smart": o.get("delivery", {}).get("smart", False),
                     } for o in offers]
-                except AllegroAPIError:
-                    return []
+                    log_request(
+                        source="api",
+                        url=url,
+                        code=ean,
+                        http_status=200,
+                        error=None,
+                        response_text=str(result)[:4000],
+                        offers_parsed=len(mapped),
+                        offer_titles=[m["title"] for m in mapped if m.get("title")],
+                        save_html_on_empty=False,
+                    )
+                    return mapped
+                except AllegroAPIError as e:
+                    log_request(
+                        source="api",
+                        url=url,
+                        code=ean,
+                        http_status=e.status_code,
+                        error=str(e),
+                        offers_parsed=0,
+                        save_html_on_empty=False,
+                    )
+                    raise
             
             return fetch_api
             

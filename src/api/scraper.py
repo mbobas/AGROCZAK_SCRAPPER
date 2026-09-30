@@ -215,150 +215,227 @@ class ScrapeDoClient:
         }
 
 
+def _extract_listing_store_state(html: str) -> tuple[list, dict]:
+    """
+    Wyciąga items.elements z __listing_StoreState.
+    Zwraca (elements, meta) gdzie meta zawiera info o metodzie / fallbacku.
+    """
+    meta: Dict[str, Any] = {
+        "parse_method": None,
+        "parse_fallback_triggered": False,
+        "has_listing_marker": "__listing_StoreState" in html,
+        "article_count": html.lower().count("<article"),
+        "ofert_mention": bool(re.search(r"\d+\s*ofert", html, re.IGNORECASE)),
+    }
+    elements: list = []
+
+    # Metoda A: JSONDecoder.raw_decode — odporne na zagnieżdżone nawiasy
+    start = html.find('{"__listing_StoreState":')
+    if start >= 0:
+        try:
+            from json import JSONDecoder
+
+            obj, _ = JSONDecoder().raw_decode(html, start)
+            elements = (
+                obj.get("__listing_StoreState", {})
+                .get("items", {})
+                .get("elements", [])
+                or []
+            )
+            if elements:
+                meta["parse_method"] = "raw_decode"
+                return elements, meta
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+
+    # Metoda B: stary regex (kompatybilność wstecz)
+    store_match = re.search(
+        r'\{"__listing_StoreState":(.*?)\}\s*</script>', html, re.DOTALL
+    )
+    if store_match:
+        try:
+            store_data = json.loads(
+                '{"__listing_StoreState":' + store_match.group(1) + "}"
+            )
+            elements = (
+                store_data.get("__listing_StoreState", {})
+                .get("items", {})
+                .get("elements", [])
+                or []
+            )
+            if elements:
+                meta["parse_method"] = "regex"
+                return elements, meta
+        except json.JSONDecodeError:
+            pass
+
+    if meta["article_count"] > 0 or meta["ofert_mention"] or meta["has_listing_marker"]:
+        meta["parse_fallback_triggered"] = True
+
+    return elements, meta
+
+
+def _offer_from_listing_item(item: dict) -> Optional[OfferData]:
+    """Mapuje jeden element listingu Allegro na OfferData."""
+    try:
+        event = item.get("eventData") or {}
+        offer_id = (
+            item.get("offerId")
+            or (event.get("offer_id") if isinstance(event, dict) else None)
+            or item.get("id")
+            or ""
+        )
+        title = item.get("alt", "") or item.get("title", {})
+        if isinstance(title, dict):
+            title = title.get("text", "")
+
+        price_data = item.get("price", {})
+        price = 0.0
+        price_str = "0"
+
+        if isinstance(price_data, dict):
+            main_price = price_data.get("mainPrice", {})
+            if isinstance(main_price, dict):
+                price_str = main_price.get("amount", "0")
+            if price_str == "0":
+                normal = price_data.get("normal", {})
+                if isinstance(normal, dict):
+                    price_str = normal.get("amount", "0")
+            if price_str == "0":
+                price_str = price_data.get("amount", "0") or "0"
+        else:
+            price_str = str(price_data)
+
+        try:
+            price = float(str(price_str).replace(",", ".").replace(" ", ""))
+        except (ValueError, TypeError):
+            pass
+
+        url = item.get("url", "") or ""
+        offer_id_str = str(offer_id)
+        if not url or "events/clicks" in url:
+            if offer_id_str:
+                slug = (
+                    re.sub(r"[^a-zA-Z0-9]+", "-", title.lower())[:50]
+                    if title
+                    else "oferta"
+                )
+                url = f"https://allegro.pl/oferta/{slug}-{offer_id_str}"
+        elif not url.startswith("http"):
+            url = "https://allegro.pl" + url
+
+        buyers_count = None
+        popularity = item.get("productPopularity") or item.get("popularity", {})
+        if isinstance(popularity, dict):
+            label = popularity.get("label", "")
+            if label:
+                num_match = re.search(r"(\d+)", str(label))
+                if num_match:
+                    buyers_count = int(num_match.group(1))
+
+        seller = item.get("seller", {})
+        seller_name = seller.get("login", "") if isinstance(seller, dict) else None
+
+        delivery = item.get("delivery", {})
+        is_smart = delivery.get("smart", False) if isinstance(delivery, dict) else False
+
+        if title and price > 0:
+            return OfferData(
+                offer_id=offer_id_str,
+                title=title,
+                price=price,
+                currency="PLN",
+                seller_name=seller_name,
+                buyers_count=buyers_count,
+                url=url,
+                is_smart=is_smart,
+            )
+    except Exception:
+        return None
+    return None
+
+
 def parse_allegro_search_html(html: str) -> List[OfferData]:
     """
     Parsuje HTML strony wynikow wyszukiwania Allegro.
     Wyciaga dane z JSON w skrypcie lub z artykulow HTML.
+    Nie wymaga kodu produktu w tytule oferty.
     """
-    offers = []
-    
-    # Metoda 1: Wyciagnij dane z JSON w skrypcie (najlepsza metoda)
-    json_match = re.search(r'"items":\s*\{"elements":\s*\[(.*?)\]\s*\}', html, re.DOTALL)
-    if json_match:
-        try:
-            # Znajdz caly obiekt __listing_StoreState
-            store_match = re.search(r'\{"__listing_StoreState":(.*?)\}\s*</script>', html, re.DOTALL)
-            if store_match:
-                import json
-                try:
-                    store_data = json.loads('{"__listing_StoreState":' + store_match.group(1) + '}')
-                    items = store_data.get('__listing_StoreState', {}).get('items', {}).get('elements', [])
-                    
-                    for item in items:
-                        try:
-                            # Wyciagnij dane
-                            offer_id = item.get('offerId', '') or item.get('id', '')
-                            title = item.get('alt', '') or item.get('title', {})
-                            if isinstance(title, dict):
-                                title = title.get('text', '')
-                            
-                            # Cena - moze byc w roznych miejscach
-                            price_data = item.get('price', {})
-                            price = 0.0
-                            price_str = '0'
-                            
-                            if isinstance(price_data, dict):
-                                # Nowy format: price.mainPrice.amount
-                                main_price = price_data.get('mainPrice', {})
-                                if isinstance(main_price, dict):
-                                    price_str = main_price.get('amount', '0')
-                                # Stary format: price.normal.amount lub price.amount
-                                if price_str == '0':
-                                    price_str = price_data.get('normal', {}).get('amount', '0')
-                                if price_str == '0':
-                                    price_str = price_data.get('amount', '0')
-                            else:
-                                price_str = str(price_data)
-                            
-                            try:
-                                price = float(str(price_str).replace(',', '.').replace(' ', ''))
-                            except (ValueError, TypeError):
-                                pass
-                            
-                            # URL - konstruuj z offerId
-                            offer_id_str = item.get('offerId', '') or item.get('id', '')
-                            url = item.get('url', '')
-                            # Jesli URL prowadzi do events/clicks, skonstruuj prawidlowy URL oferty
-                            if not url or 'events/clicks' in url:
-                                if offer_id_str:
-                                    # Slug z tytulu
-                                    slug = re.sub(r'[^a-zA-Z0-9]+', '-', title.lower())[:50] if title else 'oferta'
-                                    url = f'https://allegro.pl/oferta/{slug}-{offer_id_str}'
-                            elif not url.startswith('http'):
-                                url = 'https://allegro.pl' + url
-                            
-                            # Kupujacy - productPopularity lub popularity
-                            buyers_count = None
-                            popularity = item.get('productPopularity') or item.get('popularity', {})
-                            if isinstance(popularity, dict):
-                                label = popularity.get('label', '')
-                                if label:
-                                    # Wyciagnij liczbe z "183 osoby kupiły"
-                                    num_match = re.search(r'(\d+)', str(label))
-                                    if num_match:
-                                        buyers_count = int(num_match.group(1))
-                            
-                            # Sprzedawca
-                            seller = item.get('seller', {})
-                            seller_name = seller.get('login', '') if isinstance(seller, dict) else None
-                            
-                            # Smart
-                            delivery = item.get('delivery', {})
-                            is_smart = delivery.get('smart', False) if isinstance(delivery, dict) else False
-                            
-                            if title and price > 0:
-                                offers.append(OfferData(
-                                    offer_id=str(offer_id),
-                                    title=title,
-                                    price=price,
-                                    currency="PLN",
-                                    seller_name=seller_name,
-                                    buyers_count=buyers_count,
-                                    url=url,
-                                    is_smart=is_smart,
-                                ))
-                        except Exception:
-                            continue
-                            
-                except json.JSONDecodeError:
-                    pass
-        except Exception:
+    offers: List[OfferData] = []
+    elements, meta = _extract_listing_store_state(html)
+    parse_allegro_search_html.last_meta = meta  # type: ignore[attr-defined]
+
+    for item in elements:
+        if not isinstance(item, dict):
+            continue
+        # Pomijaj elementy niebędące ofertami (np. banners)
+        if item.get("type") and item.get("type") not in (
+            "product",
+            "offer",
+            "advertisement",
+            None,
+        ):
+            # Allegro czasem ma type=label / pagination — bez alt/price
             pass
-    
-    # Metoda 2: Fallback - parsuj artykuly HTML
+        offer = _offer_from_listing_item(item)
+        if offer:
+            offers.append(offer)
+
+    # Metoda 2: Fallback HTML articles
     if not offers:
+        meta["parse_fallback_triggered"] = True
+        parse_allegro_search_html.last_meta = meta  # type: ignore[attr-defined]
         try:
             from bs4 import BeautifulSoup
-            soup = BeautifulSoup(html, 'html.parser')
-            articles = soup.find_all('article')
-            
+
+            soup = BeautifulSoup(html, "html.parser")
+            articles = soup.find_all("article")
+
             for article in articles:
                 try:
                     text = article.get_text()
-                    
-                    # Tytul - pierwszy znaczacy tekst
-                    title_parts = [t.strip() for t in text.split('\n') if len(t.strip()) > 20]
+                    title_parts = [
+                        t.strip() for t in text.split("\n") if len(t.strip()) > 20
+                    ]
                     title = title_parts[0] if title_parts else None
-                    
-                    # Cena
+
                     price = 0.0
-                    price_match = re.search(r'(\d+[,\.]\d{2})\s*zł', text)
+                    price_match = re.search(r"(\d+[,\.]\d{2})\s*zł", text)
                     if price_match:
-                        price = float(price_match.group(1).replace(',', '.'))
-                    
-                    # Kupujacy
+                        price = float(price_match.group(1).replace(",", "."))
+
                     buyers_count = None
-                    buyers_match = re.search(r'(\d+)\s*os[oó]b', text, re.IGNORECASE)
+                    buyers_match = re.search(
+                        r"(\d+)\s*os[oó]b", text, re.IGNORECASE
+                    )
                     if buyers_match:
                         buyers_count = int(buyers_match.group(1))
-                    
+
                     if title and price > 0:
-                        offers.append(OfferData(
-                            offer_id="",
-                            title=title[:100],
-                            price=price,
-                            currency="PLN",
-                            seller_name=None,
-                            buyers_count=buyers_count,
-                            url="",
-                            is_smart='smart' in text.lower(),
-                        ))
+                        offers.append(
+                            OfferData(
+                                offer_id="",
+                                title=title[:100],
+                                price=price,
+                                currency="PLN",
+                                seller_name=None,
+                                buyers_count=buyers_count,
+                                url="",
+                                is_smart="smart" in text.lower(),
+                            )
+                        )
                 except Exception:
                     continue
+            if offers:
+                meta["parse_method"] = "beautifulsoup_articles"
+                parse_allegro_search_html.last_meta = meta  # type: ignore[attr-defined]
         except ImportError:
             pass
-    
+
     return offers
+
+
+parse_allegro_search_html.last_meta = {}  # type: ignore[attr-defined]
 
 
 def parse_allegro_offer_html(html: str) -> Optional[OfferData]:
@@ -366,8 +443,6 @@ def parse_allegro_offer_html(html: str) -> Optional[OfferData]:
     Parsuje HTML strony pojedynczej oferty Allegro.
     Wyciaga: tytul, cene, sprzedawce, "X osob kupilo".
     """
-    from html.parser import HTMLParser
-    
     offer_data = {
         "offer_id": None,
         "title": None,
@@ -420,22 +495,58 @@ def parse_allegro_offer_html(html: str) -> Optional[OfferData]:
 
 def search_allegro_by_ean(ean: str, scraper: ScrapeDoClient, render: bool = True) -> List[OfferData]:
     """
-    Wyszukuje produkty na Allegro po kodzie EAN.
+    Wyszukuje produkty na Allegro po kodzie EAN / kodzie producenta.
     Zwraca liste ofert z informacjami o sprzedazy.
-    
-    Args:
-        ean: Kod EAN produktu
-        scraper: Instancja ScrapeDoClient
-        render: Czy renderowac JavaScript (True = wiecej kredytow, lepsze dane)
+    Loguje request/response do data/logs/.
     """
+    from src.core.request_log import log_request
+
     search_url = f"https://allegro.pl/listing?string={quote_plus(ean)}"
-    
+    html = ""
+    http_status = None
+    error = None
+    offers: List[OfferData] = []
+
     try:
-        html = scraper.scrape(search_url, render=render)
-        return parse_allegro_search_html(html)
+        # scrape() rzuca przy != 200 — złap poniżej
+        params = {
+            "token": scraper.token,
+            "url": search_url,
+            "render": str(render).lower(),
+        }
+        response = scraper._make_request(scraper.BASE_URL, params=params, timeout=60)
+        scraper._update_stats_from_headers(response, search_url)
+        http_status = response.status_code
+        html = response.text or ""
+
+        if response.status_code != 200:
+            error = f"scrape.do status {response.status_code}: {html[:200]}"
+            raise ScraperError(error)
+
+        offers = parse_allegro_search_html(html)
+        return offers
     except ScraperError as e:
+        error = str(e)
         print(f"Blad scrapowania: {e}")
-        return []
+        raise
+    except Exception as e:
+        error = str(e)
+        print(f"Blad scrapowania: {e}")
+        raise
+    finally:
+        meta = getattr(parse_allegro_search_html, "last_meta", {}) or {}
+        log_request(
+            source="scrape_do",
+            url=search_url,
+            code=ean,
+            http_status=http_status,
+            error=error,
+            response_text=html if html else None,
+            offers_parsed=len(offers),
+            offer_titles=[o.title for o in offers],
+            extra={"parse_meta": meta, "render": render},
+            save_html_on_empty=True,
+        )
 
 
 def create_scrape_fetcher(render: bool = True) -> callable:

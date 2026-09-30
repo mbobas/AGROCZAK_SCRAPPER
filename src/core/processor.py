@@ -44,12 +44,23 @@ class ProductResult:
     best_match: Optional[AllegroOffer] = None
     status: str = "pending"  # pending, checked, error
     error_message: Optional[str] = None
+    from_cache: bool = False
     
     def to_dict(self) -> Dict[str, Any]:
         result = asdict(self)
-        result["offers"] = [asdict(o) for o in self.offers]
-        result["matching_offers"] = [asdict(o) for o in self.matching_offers]
-        result["best_match"] = asdict(self.best_match) if self.best_match else None
+        result["offers"] = [
+            asdict(o) if hasattr(o, "__dataclass_fields__") else o for o in self.offers
+        ]
+        result["matching_offers"] = [
+            asdict(o) if hasattr(o, "__dataclass_fields__") else o
+            for o in self.matching_offers
+        ]
+        if self.best_match is None:
+            result["best_match"] = None
+        elif hasattr(self.best_match, "__dataclass_fields__"):
+            result["best_match"] = asdict(self.best_match)
+        else:
+            result["best_match"] = self.best_match
         return result
 
 
@@ -139,7 +150,10 @@ class ProductProcessor:
         # Sprawdz cache
         cached = self.cache.get_if_valid(product.ean, self.config.ttl_days)
         if cached:
-            return ProductResult(**cached)
+            field_names = set(ProductResult.__dataclass_fields__.keys())
+            data = {k: v for k, v in cached.items() if k in field_names}
+            data["from_cache"] = True
+            return ProductResult(**data)
         
         if not self.data_fetcher:
             result.status = "error"
@@ -180,6 +194,7 @@ class ProductProcessor:
         except Exception as e:
             result.status = "error"
             result.error_message = str(e)
+            # Bledow nie cache'ujemy — unikamy falszywego "nie znaleziono"
         
         return result
     

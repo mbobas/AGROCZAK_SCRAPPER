@@ -21,7 +21,7 @@ import pandas as pd
 from src.core.processor import ProductProcessor, ProcessorConfig, InputProduct, ProductResult
 from src.core.cache import ProductCache
 from src.api.allegro import AllegroClient, AllegroAPIError
-from src.api.scraper import ScrapeDoClient, ScraperError
+from src.api.scraper import ScrapeDoClient, ScraperError, search_allegro_by_ean
 
 
 st.set_page_config(
@@ -39,6 +39,8 @@ def init_session_state():
         st.session_state.results = []
     if "running" not in st.session_state:
         st.session_state.running = False
+    if "paused" not in st.session_state:
+        st.session_state.paused = False
     if "progress" not in st.session_state:
         st.session_state.progress = 0
     if "total" not in st.session_state:
@@ -49,6 +51,211 @@ def init_session_state():
         st.session_state.scrape_client = None
     if "credits_info" not in st.session_state:
         st.session_state.credits_info = None
+    if "range_start" not in st.session_state:
+        st.session_state.range_start = 1
+    if "range_end" not in st.session_state:
+        st.session_state.range_end = 100
+    if "batch_size" not in st.session_state:
+        st.session_state.batch_size = 100
+    if "range_df_len" not in st.session_state:
+        st.session_state.range_df_len = 0
+    if "job_products" not in st.session_state:
+        st.session_state.job_products = []
+    if "job_index" not in st.session_state:
+        st.session_state.job_index = 0
+    if "current_ean" not in st.session_state:
+        st.session_state.current_ean = None
+    if "data_source" not in st.session_state:
+        st.session_state.data_source = "scrape_do"
+
+
+def _row_value(row: pd.Series, *keys: str) -> str:
+    """Pobiera pierwszą niepustą wartość z wiersza po liście kluczy (case-insensitive)."""
+    lower_map = {str(c).strip().lower(): c for c in row.index}
+    for key in keys:
+        col = key if key in row.index else lower_map.get(key.lower())
+        if col is None:
+            continue
+        val = row[col]
+        if pd.isna(val):
+            continue
+        text = str(val).strip()
+        if text:
+            return text
+    return ""
+
+
+def df_to_input_products(df: pd.DataFrame) -> list[InputProduct]:
+    """Konwertuje DataFrame (Kod produktu/brutto lub ean/cena) na listę InputProduct."""
+    products: list[InputProduct] = []
+    for _, row in df.iterrows():
+        code = _row_value(
+            row,
+            "Kod produktu",
+            "ean",
+            "EAN",
+            "kod",
+            "code",
+        )
+        if not code:
+            continue
+
+        price_raw = _row_value(
+            row,
+            "brutto",
+            "cena",
+            "price",
+            "my_price",
+        )
+        try:
+            price = float(price_raw.replace(",", ".").replace(" ", "")) if price_raw else 0.0
+        except ValueError:
+            price = 0.0
+
+        name = _row_value(row, "nazwa", "name") or None
+        products.append(InputProduct(ean=code, my_price=price, name=name))
+    return products
+
+
+def build_data_fetcher(source: str):
+    """
+    Tworzy data_fetcher dla ProductProcessor.
+    scrape_do reuse'uje ScrapeDoClient z sesji (spójne kredyty).
+    Zwraca None i pokazuje błąd przy braku konfiguracji.
+    Błędy API są propagowane (status=error), nie maskowane jako pusta lista.
+    """
+    from src.core.request_log import log_request
+
+    if source == "scrape_do":
+        client = get_scrape_client()
+        if client is None:
+            st.error("Brak tokena scrape.do w .env — nie można uruchomić scrapowania.")
+            return None
+
+        def fetch_scrape(ean: str) -> list[dict]:
+            offers = search_allegro_by_ean(ean, client, render=True)
+            return [
+                {
+                    "offer_id": o.offer_id,
+                    "title": o.title,
+                    "price": o.price,
+                    "currency": o.currency,
+                    "seller_name": o.seller_name,
+                    "buyers_count": o.buyers_count,
+                    "url": o.url,
+                    "is_smart": o.is_smart,
+                }
+                for o in offers
+            ]
+
+        return fetch_scrape
+
+    if source == "api":
+        try:
+            allegro = AllegroClient()
+            allegro.get_token()
+        except Exception as e:
+            st.error(f"API Allegro niedostępne: {e}")
+            return None
+
+        def fetch_api(ean: str) -> list[dict]:
+            url = f"{allegro.API_URL}/offers/listing"
+            try:
+                result = allegro.search_offers(phrase=ean)
+                items = result.get("items", {})
+                offers = items.get("promoted", []) + items.get("regular", [])
+                mapped = [
+                    {
+                        "offer_id": o.get("id", ""),
+                        "title": o.get("name", ""),
+                        "price": float(
+                            o.get("sellingMode", {}).get("price", {}).get("amount", 0)
+                        ),
+                        "currency": o.get("sellingMode", {})
+                        .get("price", {})
+                        .get("currency", "PLN"),
+                        "seller_name": o.get("seller", {}).get("login", ""),
+                        "buyers_count": o.get("popularity", {}).get("soldCount"),
+                        "url": f"https://allegro.pl/oferta/{o.get('id', '')}",
+                        "is_smart": o.get("delivery", {}).get("smart", False),
+                    }
+                    for o in offers
+                ]
+                log_request(
+                    source="api",
+                    url=url,
+                    code=ean,
+                    http_status=200,
+                    error=None,
+                    response_text=json.dumps(result, ensure_ascii=False)[:4000],
+                    offers_parsed=len(mapped),
+                    offer_titles=[m["title"] for m in mapped if m.get("title")],
+                    extra={"phrase": ean},
+                    save_html_on_empty=False,
+                )
+                return mapped
+            except AllegroAPIError as e:
+                log_request(
+                    source="api",
+                    url=url,
+                    code=ean,
+                    http_status=e.status_code,
+                    error=str(e),
+                    response_text=None,
+                    offers_parsed=0,
+                    offer_titles=[],
+                    extra={"code": e.code, "phrase": ean},
+                    save_html_on_empty=False,
+                )
+                raise
+
+        return fetch_api
+
+    st.error(f"Nieznane źródło danych: {source}")
+    return None
+
+
+def _clamp_range(start: int, end: int, n_total: int) -> tuple[int, int]:
+    """Przycina zakres 1-based do granic listy i wymusza od <= do."""
+    if n_total <= 0:
+        return 1, 1
+    start = max(1, min(int(start), n_total))
+    end = max(1, min(int(end), n_total))
+    if start > end:
+        start, end = end, start
+    return start, end
+
+
+def _apply_range(start: int, end: int, n_total: int) -> None:
+    """Ustawia range_start / range_end w session_state."""
+    start, end = _clamp_range(start, end, n_total)
+    st.session_state.range_start = start
+    st.session_state.range_end = end
+
+
+def _on_range_preset_change() -> None:
+    """Callback: aplikuje wybrany preset zakresu."""
+    preset = st.session_state.get("range_preset")
+    n_total = st.session_state.get("range_df_len", 0)
+    if not preset or n_total <= 0:
+        return
+
+    batch_size = int(st.session_state.get("batch_size", 100))
+    can_process = st.session_state.get("range_can_process")
+
+    if preset == "Pierwsze 5":
+        _apply_range(1, 5, n_total)
+    elif preset == "Pierwsze 10":
+        _apply_range(1, 10, n_total)
+    elif preset == "10–15 (test)":
+        _apply_range(10, 15, n_total)
+    elif preset == "Pierwsze 100":
+        _apply_range(1, 100, n_total)
+    elif preset == "Według partii":
+        _apply_range(1, batch_size, n_total)
+    elif preset == "Max wg kredytów":
+        limit = can_process if can_process is not None else n_total
+        _apply_range(1, max(1, int(limit)), n_total)
 
 
 def get_scrape_client():
@@ -112,10 +319,15 @@ def sidebar_config():
     
     # Źródło danych
     st.sidebar.subheader("Źródło danych")
+    source_options = ["scrape_do", "api"]
+    current = st.session_state.get("data_source", "scrape_do")
+    if current not in source_options:
+        current = "scrape_do"
     source = st.sidebar.selectbox(
         "Wybierz źródło",
-        ["api", "scrape_do"],
-        help="api = API Allegro (wymaga weryfikacji), scrape_do = scraping"
+        source_options,
+        index=source_options.index(current),
+        help="scrape_do = listing jak w przeglądarce; api = API Allegro (wymaga weryfikacji)",
     )
     st.session_state.data_source = source
     
@@ -129,6 +341,22 @@ def sidebar_config():
         cache.clear_all()
         st.sidebar.success("Cache wyczyszczony!")
         st.rerun()
+
+    # Logi zapytań
+    from src.core.request_log import get_last_log, logs_dir
+
+    st.sidebar.divider()
+    st.sidebar.subheader("📋 Logi zapytań")
+    st.sidebar.caption(f"Katalog: `{logs_dir()}`")
+    last = get_last_log()
+    if last:
+        st.sidebar.caption(
+            f"Ostatnie: `{last.get('code')}` · oferty={last.get('offers_parsed')} · "
+            f"status={last.get('http_status')} · err={last.get('error') or '—'}"
+        )
+        st.sidebar.caption(f"Plik: `{last.get('path')}`")
+    else:
+        st.sidebar.caption("Brak logów w tej sesji.")
     
     # Kredyty scrape.do
     st.sidebar.divider()
@@ -210,13 +438,146 @@ def upload_section():
         try:
             df = pd.read_csv(uploaded_file, sep=";")
             st.success(f"Wczytano {len(df)} produktów")
-            st.dataframe(df.head(10), use_container_width=True)
+            st.dataframe(df.head(10), width="stretch")
             st.session_state.input_df = df
             return df
         except Exception as e:
             st.error(f"Błąd wczytywania: {e}")
     
     return None
+
+
+def _on_range_bounds_change() -> None:
+    """Callback: utrzymaj od <= do w granicach listy."""
+    n_total = st.session_state.get("range_df_len", 0)
+    if n_total <= 0:
+        return
+    start, end = _clamp_range(
+        st.session_state.range_start,
+        st.session_state.range_end,
+        n_total,
+    )
+    st.session_state.range_start = start
+    st.session_state.range_end = end
+
+
+def _on_next_batch() -> None:
+    """Callback: przesuń zakres o rozmiar partii do przodu."""
+    n_total = st.session_state.get("range_df_len", 0)
+    if n_total <= 0:
+        return
+    next_start = int(st.session_state.range_end) + 1
+    if next_start > n_total:
+        return
+    batch = int(st.session_state.get("batch_size", 100))
+    _apply_range(next_start, next_start + batch - 1, n_total)
+    st.session_state.range_preset = None
+
+
+def range_section(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Sekcja wyboru zakresu wierszy do scrapowania.
+    Numeracja 1-based (jak w Excelu). Zwraca wycinek DataFrame.
+    """
+    st.subheader("Zakres produktów")
+    n_total = len(df)
+
+    # Reset zakresu przy nowym / innym pliku — domyślnie pierwsze 100
+    if st.session_state.range_df_len != n_total:
+        st.session_state.range_df_len = n_total
+        _apply_range(1, min(100, n_total), n_total)
+        st.session_state.range_preset = None
+
+    # Ile maksymalnie pozwala saldo kredytów (dla presetu)
+    can_process = None
+    client = get_scrape_client()
+    if client:
+        if st.session_state.credits_info is None:
+            refresh_credits_info()
+        # Utrzymaj stats klienta zsynchronizowane z cache w sesji
+        info = st.session_state.credits_info
+        if info and "error" not in info:
+            remaining = info.get("RemainingMonthlyRequest")
+            if remaining is not None:
+                client.stats.remaining_credits = remaining
+            max_monthly = info.get("MaxMonthlyRequest")
+            if max_monthly is not None:
+                client.stats.max_monthly_credits = max_monthly
+        estimate = client.estimate_cost(1, render=True)
+        can_process = estimate.get("can_process")
+    st.session_state.range_can_process = can_process
+
+    st.pills(
+        "Presety",
+        options=[
+            "Pierwsze 5",
+            "Pierwsze 10",
+            "10–15 (test)",
+            "Pierwsze 100",
+            "Według partii",
+            "Max wg kredytów",
+        ],
+        key="range_preset",
+        on_change=_on_range_preset_change,
+        help="Szybkie zaznaczenie zakresu. „Według partii” = pierwsze N wg rozmiaru partii poniżej.",
+    )
+
+    col_from, col_to, col_batch = st.columns(3)
+    with col_from:
+        st.number_input(
+            "Od wiersza",
+            min_value=1,
+            max_value=max(n_total, 1),
+            step=1,
+            key="range_start",
+            on_change=_on_range_bounds_change,
+        )
+    with col_to:
+        st.number_input(
+            "Do wiersza",
+            min_value=1,
+            max_value=max(n_total, 1),
+            step=1,
+            key="range_end",
+            on_change=_on_range_bounds_change,
+        )
+    with col_batch:
+        st.number_input(
+            "Rozmiar partii",
+            min_value=1,
+            max_value=1000,
+            step=1,
+            key="batch_size",
+            help="Używane przez preset „Według partii” i przycisk „Kolejna partia”.",
+        )
+
+    start, end = _clamp_range(
+        st.session_state.range_start,
+        st.session_state.range_end,
+        n_total,
+    )
+    selected_count = end - start + 1
+    st.caption(f"Wybrane: wiersze {start}–{end} ({selected_count} z {n_total})")
+
+    next_start = end + 1
+    can_next = next_start <= n_total and not st.session_state.running
+    st.button(
+        ":material/skip_next: Kolejna partia",
+        disabled=not can_next,
+        on_click=_on_next_batch,
+        help=(
+            f"Przesuwa zakres o rozmiar partii ({st.session_state.batch_size}) "
+            "do przodu — osobno od Pauza/Wznów."
+            if can_next
+            else "Brak kolejnych wierszy lub trwa przetwarzanie."
+        ),
+    )
+
+    selected_df = df.iloc[start - 1 : end].copy()
+    with st.expander("Podgląd wybranego zakresu", expanded=selected_count <= 20):
+        st.dataframe(selected_df, width="stretch")
+
+    return selected_df
 
 
 def cost_estimate_section(num_products: int):
@@ -257,55 +618,63 @@ def cost_estimate_section(num_products: int):
 def control_section():
     """Sekcja kontroli procesu."""
     st.header("🎮 Kontrola")
-    
+
+    running = st.session_state.running
+    paused = st.session_state.paused
+
     col1, col2, col3, col4 = st.columns(4)
-    
+
     with col1:
-        start_btn = st.button("▶️ Start", disabled=st.session_state.running)
-    
+        start_btn = st.button("▶️ Start", disabled=running)
     with col2:
-        pause_btn = st.button("⏸️ Pauza", disabled=not st.session_state.running)
-    
+        pause_btn = st.button("⏸️ Pauza", disabled=not running or paused)
     with col3:
-        resume_btn = st.button("▶️ Wznów", disabled=not st.session_state.running)
-    
+        resume_btn = st.button("▶️ Wznów", disabled=not running or not paused)
     with col4:
-        stop_btn = st.button("⏹️ Stop", disabled=not st.session_state.running)
-    
+        stop_btn = st.button("⏹️ Stop", disabled=not running)
+
     return start_btn, pause_btn, resume_btn, stop_btn
 
 
 def progress_section():
     """Sekcja postępu."""
-    if st.session_state.running or st.session_state.results:
-        st.header("📈 Postęp")
-        
-        progress = st.session_state.progress
-        total = st.session_state.total
-        
-        if total > 0:
-            st.progress(progress / total)
-            st.write(f"Sprawdzono: {progress} / {total}")
-        
-        # Metryki
-        results = st.session_state.results
-        if results:
-            col1, col2, col3, col4 = st.columns(4)
-            
-            with col1:
-                st.metric("Sprawdzonych", len(results))
-            
-            with col2:
-                found = sum(1 for r in results if r.get("found_on_allegro"))
-                st.metric("Znalezionych", found)
-            
-            with col3:
-                matching = sum(1 for r in results if r.get("matching_offers"))
-                st.metric("Z pasującymi", matching)
-            
-            with col4:
-                errors = sum(1 for r in results if r.get("status") == "error")
-                st.metric("Błędów", errors)
+    if not (st.session_state.running or st.session_state.results):
+        return
+
+    st.header("📈 Postęp")
+
+    progress = st.session_state.progress
+    total = st.session_state.total
+
+    if total > 0:
+        st.progress(min(progress / total, 1.0))
+        st.write(f"Sprawdzono: {progress} / {total}")
+
+    if st.session_state.running and st.session_state.paused:
+        st.warning("Wstrzymano — kliknij Wznów, aby kontynuować.")
+    elif st.session_state.running:
+        products = st.session_state.job_products
+        idx = st.session_state.job_index
+        if products and idx < len(products):
+            st.info(f"Sprawdzam: `{products[idx].ean}`")
+        elif st.session_state.current_ean:
+            st.info(f"Sprawdzam: `{st.session_state.current_ean}`")
+
+    results = st.session_state.results
+    if results:
+        col1, col2, col3, col4 = st.columns(4)
+
+        with col1:
+            st.metric("Sprawdzonych", len(results))
+        with col2:
+            found = sum(1 for r in results if r.get("found_on_allegro"))
+            st.metric("Znalezionych", found)
+        with col3:
+            matching = sum(1 for r in results if r.get("matching_offers"))
+            st.metric("Z pasującymi", matching)
+        with col4:
+            errors = sum(1 for r in results if r.get("status") == "error")
+            st.metric("Błędów", errors)
 
 
 def results_section():
@@ -327,6 +696,8 @@ def results_section():
                 "Cena Allegro": best.get("price") if best else None,
                 "Kupujących": best.get("buyers_count") if best else None,
                 "Status": r.get("status"),
+                "Cache": "tak" if r.get("from_cache") else "",
+                "Błąd": r.get("error_message") or "",
             })
         
         df = pd.DataFrame(data)
@@ -343,7 +714,7 @@ def results_section():
         if show_only_found:
             df = df[df["Znaleziono"] == "✅"]
         
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(df, width="stretch")
         
         # Export
         col1, col2 = st.columns(2)
@@ -368,48 +739,140 @@ def results_section():
             )
 
 
+def _stop_job() -> None:
+    """Zatrzymuje bieżące zadanie i czyści kolejkę."""
+    st.session_state.running = False
+    st.session_state.paused = False
+    st.session_state.current_ean = None
+    st.session_state.job_products = []
+    st.session_state.job_index = 0
+    processor = st.session_state.processor
+    if processor is not None:
+        processor.stop()
+
+
+def process_job_tick() -> None:
+    """
+    Przetwarza jeden produkt z kolejki (jeden krok na rerun).
+    Wywoływać po sekcji postępu, gdy running and not paused.
+    """
+    if not st.session_state.running or st.session_state.paused:
+        return
+
+    products: list[InputProduct] = st.session_state.job_products
+    idx = st.session_state.job_index
+    processor: ProductProcessor | None = st.session_state.processor
+
+    if not products or processor is None:
+        _stop_job()
+        st.error("Brak kolejki produktów lub procesora — zatrzymano.")
+        return
+
+    if idx >= len(products):
+        st.session_state.running = False
+        st.session_state.paused = False
+        st.session_state.current_ean = None
+        refresh_credits_info()
+        st.success(f"Zakończono — sprawdzono {len(st.session_state.results)} produktów.")
+        return
+
+    product = products[idx]
+    st.session_state.current_ean = product.ean
+    st.caption(f"Pobieranie danych dla `{product.ean}`…")
+
+    result = processor.process_single(product)
+    st.session_state.results.append(result.to_dict())
+    st.session_state.job_index = idx + 1
+    st.session_state.progress = idx + 1
+
+    if st.session_state.job_index >= len(products):
+        st.session_state.running = False
+        st.session_state.paused = False
+        st.session_state.current_ean = None
+        refresh_credits_info()
+        st.success(f"Zakończono — sprawdzono {len(st.session_state.results)} produktów.")
+        st.rerun()
+        return
+
+    delay = float(st.session_state.config.delay_seconds)
+    time.sleep(delay)
+    st.rerun()
+
+
 def main():
     st.title("📊 Allegro Price Monitor")
     st.caption("Sprawdzanie cen i sprzedaży produktów na Allegro")
-    
+
     init_session_state()
     sidebar_config()
-    
-    # Upload
+
     df = upload_section()
-    
-    # Szacowanie kosztów (jeśli wczytano plik)
+
     can_start = True
+    selected_df = None
     if df is not None and len(df) > 0:
-        can_start = cost_estimate_section(len(df))
-    
-    # Kontrola
+        selected_df = range_section(df)
+        if st.session_state.data_source == "scrape_do":
+            can_start = cost_estimate_section(len(selected_df))
+        else:
+            cost_estimate_section(len(selected_df))
+
     start_btn, pause_btn, resume_btn, stop_btn = control_section()
-    
-    if start_btn and df is not None and can_start:
-        st.session_state.running = True
-        st.session_state.results = []
-        st.session_state.total = len(df)
-        st.session_state.progress = 0
-        
-        # Odśwież kredyty po starcie
-        refresh_credits_info()
-        
-        st.info("Przetwarzanie rozpoczęte... (odśwież stronę, aby zobaczyć postęp)")
+
+    if start_btn and selected_df is not None and can_start:
+        products = df_to_input_products(selected_df)
+        if not products:
+            st.error("Brak produktów z kodem w wybranym zakresie.")
+        else:
+            source = st.session_state.get("data_source", "scrape_do")
+            fetcher = build_data_fetcher(source)
+            if fetcher is not None:
+                st.session_state.processor = ProductProcessor(
+                    config=st.session_state.config,
+                    data_fetcher=fetcher,
+                )
+                st.session_state.job_products = products
+                st.session_state.job_index = 0
+                st.session_state.results = []
+                st.session_state.total = len(products)
+                st.session_state.progress = 0
+                st.session_state.current_ean = None
+                st.session_state.paused = False
+                st.session_state.running = True
+                st.session_state.selected_df = selected_df
+                if source == "scrape_do":
+                    refresh_credits_info()
+                st.info(
+                    f"Przetwarzanie wierszy "
+                    f"{st.session_state.range_start}–{st.session_state.range_end} "
+                    f"({len(products)} produktów, źródło: `{source}`)."
+                )
+    elif start_btn and selected_df is None:
+        st.error("Najpierw wczytaj plik CSV.")
     elif start_btn and not can_start:
-        st.error("Nie można rozpocząć - za mało kredytów!")
-    
+        st.error("Nie można rozpocząć - za mało kredytów na wybrany zakres!")
+
+    if pause_btn and st.session_state.running:
+        st.session_state.paused = True
+        processor = st.session_state.processor
+        if processor is not None:
+            processor.pause()
+
+    if resume_btn and st.session_state.running and st.session_state.paused:
+        st.session_state.paused = False
+        processor = st.session_state.processor
+        if processor is not None:
+            processor.resume()
+        st.rerun()
+
     if stop_btn:
-        st.session_state.running = False
+        _stop_job()
         st.warning("Zatrzymano")
-    
-    # Postęp
+
     progress_section()
-    
-    # Wyniki
     results_section()
-    
-    # Statystyki sesji scrape.do
+    process_job_tick()
+
     client = get_scrape_client()
     if client and client.stats.total_requests > 0:
         st.sidebar.divider()
@@ -419,12 +882,11 @@ def main():
         Kredytów użyto: {client.stats.total_credits_used}  
         Ostatni koszt: {client.stats.last_request_cost}
         """)
-    
-    # Info
+
     st.sidebar.divider()
     st.sidebar.caption("""
     **Allegro Price Monitor**  
-    Wersja 1.1
+    Wersja 1.2
     
     Tryb konsolowy:
     ```
