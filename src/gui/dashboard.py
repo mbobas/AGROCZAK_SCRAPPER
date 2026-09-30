@@ -67,6 +67,12 @@ def init_session_state():
         st.session_state.current_ean = None
     if "data_source" not in st.session_state:
         st.session_state.data_source = "scrape_do"
+    if "last_autosave_path" not in st.session_state:
+        st.session_state.last_autosave_path = None
+    if "analyze_products" not in st.session_state:
+        st.session_state.analyze_products = []
+    if "analyze_source_label" not in st.session_state:
+        st.session_state.analyze_source_label = None
 
 
 def _row_value(row: pd.Series, *keys: str) -> str:
@@ -678,65 +684,259 @@ def progress_section():
 
 
 def results_section():
-    """Sekcja wyników."""
-    if st.session_state.results:
-        st.header("📋 Wyniki")
-        
-        results = st.session_state.results
-        
-        # Konwersja do DataFrame
-        data = []
+    """Sekcja wyników scrapowania — podsumowanie ofert + ekspandery."""
+    from src.core.results_io import save_results_json, summary_row, offer_stats
+
+    if not st.session_state.results:
+        return
+
+    st.header("Wyniki")
+    results = st.session_state.results
+
+    rows = [summary_row(r) for r in results]
+    df = pd.DataFrame(rows)
+
+    filter_col1, filter_col2 = st.columns(2)
+    with filter_col1:
+        show_only_matching = st.checkbox(
+            "Tylko z pasującymi (wg filtrów scrapa)",
+            key="scrape_only_matching",
+        )
+    with filter_col2:
+        show_only_found = st.checkbox(
+            "Tylko znalezione na Allegro",
+            key="scrape_only_found",
+        )
+
+    view = df
+    if show_only_matching:
+        view = view[view["Pasujące"] > 0]
+    if show_only_found:
+        view = view[view["Znaleziono"] == "tak"]
+
+    st.dataframe(view, width="stretch")
+
+    with st.expander("Szczegóły ofert (wszystkie ceny)", expanded=False):
         for r in results:
-            best = r.get("best_match")
-            data.append({
-                "EAN": r.get("ean"),
-                "Moja cena": r.get("my_price"),
-                "Nazwa": r.get("name", ""),
-                "Znaleziono": "✅" if r.get("found_on_allegro") else "❌",
-                "Cena Allegro": best.get("price") if best else None,
-                "Kupujących": best.get("buyers_count") if best else None,
-                "Status": r.get("status"),
-                "Cache": "tak" if r.get("from_cache") else "",
-                "Błąd": r.get("error_message") or "",
-            })
-        
-        df = pd.DataFrame(data)
-        
-        # Filtrowanie
-        filter_col1, filter_col2 = st.columns(2)
-        with filter_col1:
-            show_only_matching = st.checkbox("Tylko z pasującymi ofertami")
-        with filter_col2:
-            show_only_found = st.checkbox("Tylko znalezione na Allegro")
-        
-        if show_only_matching:
-            df = df[df["Kupujących"].notna()]
-        if show_only_found:
-            df = df[df["Znaleziono"] == "✅"]
-        
-        st.dataframe(df, width="stretch")
-        
-        # Export
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("💾 Zapisz JSON"):
-                output_path = f"data/output/results_{datetime.now().strftime('%Y-%m-%d_%H%M')}.json"
-                Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-                with open(output_path, "w", encoding="utf-8") as f:
-                    json.dump({
-                        "generated_at": datetime.now().isoformat(),
-                        "products": results
-                    }, f, ensure_ascii=False, indent=2)
-                st.success(f"Zapisano: {output_path}")
-        
-        with col2:
-            csv = df.to_csv(index=False, sep=";")
-            st.download_button(
-                "📥 Pobierz CSV",
-                csv,
-                f"results_{datetime.now().strftime('%Y-%m-%d')}.csv",
-                "text/csv"
+            stats = offer_stats(r)
+            code = r.get("ean")
+            st.markdown(
+                f"**`{code}`** — ofert: {stats['offers_count']}, "
+                f"cena {stats['min_price']}–{stats['max_price']}"
             )
+            if stats["offers"]:
+                offers_df = pd.DataFrame(
+                    [
+                        {
+                            "Tytuł": o.get("title"),
+                            "Cena": o.get("price"),
+                            "Sprzedawca": o.get("seller_name"),
+                            "Kupujących": o.get("buyers_count"),
+                            "URL": o.get("url"),
+                        }
+                        for o in stats["offers"]
+                    ]
+                )
+                st.dataframe(offers_df, width="stretch")
+            else:
+                st.caption("Brak ofert.")
+
+    if st.session_state.last_autosave_path:
+        st.success(f"Ostatni autozapis: `{st.session_state.last_autosave_path}`")
+
+    st.caption(
+        "Autozapis po zakończeniu scrapowania: `data/output/` "
+        "(timestamp + `results_latest.json`). Ręczne zapisywanie nadal dostępne."
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Zapisz wyniki JSON (pełne oferty)", key="manual_save_json"):
+            path = save_results_json(results)
+            st.success(f"Zapisano: {path}")
+    with col2:
+        csv = view.to_csv(index=False, sep=";")
+        st.download_button(
+            "Pobierz CSV (podsumowanie)",
+            csv,
+            f"results_summary_{datetime.now().strftime('%Y-%m-%d')}.csv",
+            "text/csv",
+            key="manual_download_csv",
+            help="CSV = tabela podsumowania. Pełne oferty są w JSON.",
+        )
+
+
+def analyze_section():
+    """Zakładka: wczytaj JSON wyników i filtruj lokalnie (bez kredytów)."""
+    from src.core.results_io import (
+        filter_products,
+        flatten_offers,
+        list_result_files,
+        load_results_json,
+        save_results_json,
+        summary_row,
+    )
+
+    st.header("Analiza wyników")
+    st.caption(
+        "Wczytaj zapisany JSON i filtruj lokalnie — bez ponownego scrapowania / kredytów."
+    )
+
+    files = list_result_files()
+    file_labels = [f.name for f in files]
+    source_mode = st.radio(
+        "Źródło danych",
+        ["Plik z data/output", "Upload JSON"],
+        horizontal=True,
+        key="analyze_source_mode",
+    )
+
+    if source_mode == "Plik z data/output":
+        if not file_labels:
+            st.info("Brak plików w `data/output/`. Najpierw uruchom scrapowanie.")
+        else:
+            choice = st.selectbox(
+                "Wybierz plik wyników", file_labels, key="analyze_file_pick"
+            )
+            if st.button("Wczytaj wybrany plik", key="analyze_load_file"):
+                path = next(f for f in files if f.name == choice)
+                st.session_state.analyze_products = load_results_json(path)
+                st.session_state.analyze_source_label = str(path)
+                st.rerun()
+    else:
+        uploaded = st.file_uploader(
+            "Wgraj results_*.json",
+            type=["json"],
+            key="analyze_upload",
+        )
+        if uploaded is not None and st.button(
+            "Wczytaj upload", key="analyze_load_upload"
+        ):
+            raw = json.loads(uploaded.getvalue().decode("utf-8"))
+            if isinstance(raw, dict):
+                st.session_state.analyze_products = list(raw.get("products") or [])
+            else:
+                st.session_state.analyze_products = list(raw or [])
+            st.session_state.analyze_source_label = uploaded.name
+            st.rerun()
+
+    products = st.session_state.analyze_products or []
+    if st.session_state.analyze_source_label:
+        st.caption(
+            f"Wczytano: `{st.session_state.analyze_source_label}` "
+            f"({len(products)} produktów)"
+        )
+
+    if not products:
+        return
+
+    st.subheader("Filtry lokalne")
+    c1, c2 = st.columns(2)
+    with c1:
+        markup_range = st.slider(
+            "Zakres marży % (względem mojej ceny)",
+            min_value=0,
+            max_value=100,
+            value=(0, 50),
+            key="analyze_markup_range",
+        )
+        min_offers = st.number_input(
+            "Min. liczba ofert",
+            min_value=0,
+            max_value=100,
+            value=1,
+            key="analyze_min_offers",
+        )
+    with c2:
+        require_offers = st.checkbox(
+            "Tylko z co najmniej jedną ofertą",
+            value=True,
+            key="analyze_require_offers",
+        )
+        require_buyers = st.checkbox(
+            "Wymagaj liczby kupujących",
+            value=False,
+            key="analyze_require_buyers",
+            help="Gdy wyłączone, oferty bez buyers_count też przechodzą.",
+        )
+        min_buyers = st.number_input(
+            "Min. kupujących (gdy wymagane / gdy podane)",
+            min_value=0,
+            max_value=1000,
+            value=0,
+            key="analyze_min_buyers",
+        )
+        match_mode = st.selectbox(
+            "Kryterium marży",
+            options=["any_in_range", "cheapest_in_range"],
+            format_func=lambda x: (
+                "Którakolwiek oferta w zakresie"
+                if x == "any_in_range"
+                else "Najtańsza oferta w zakresie"
+            ),
+            key="analyze_match_mode",
+        )
+
+    filtered = filter_products(
+        products,
+        markup_min_pct=float(markup_range[0]),
+        markup_max_pct=float(markup_range[1]),
+        min_offers=int(min_offers),
+        require_offers=require_offers,
+        min_buyers=int(min_buyers) if min_buyers > 0 else None,
+        require_buyers=require_buyers,
+        match_mode=match_mode,
+    )
+
+    st.metric("Po filtrach", f"{len(filtered)} / {len(products)}")
+
+    summary_df = pd.DataFrame([summary_row(p) for p in filtered])
+    st.dataframe(summary_df, width="stretch")
+
+    flat = flatten_offers(filtered)
+    with st.expander(f"Oferty spłaszczone ({len(flat)})", expanded=True):
+        if flat:
+            st.dataframe(pd.DataFrame(flat), width="stretch")
+        else:
+            st.caption("Brak ofert po filtrach.")
+
+    st.subheader("Eksport przefiltrowanych")
+    ec1, ec2 = st.columns(2)
+    with ec1:
+        if st.button("Zapisz przefiltrowane JSON", key="analyze_save_json"):
+            path = save_results_json(filtered)
+            st.success(f"Zapisano: {path}")
+    with ec2:
+        if flat:
+            st.download_button(
+                "Pobierz oferty CSV",
+                pd.DataFrame(flat).to_csv(index=False, sep=";"),
+                f"offers_filtered_{datetime.now().strftime('%Y-%m-%d')}.csv",
+                "text/csv",
+                key="analyze_download_csv",
+            )
+        st.download_button(
+            "Pobierz podsumowanie CSV",
+            summary_df.to_csv(index=False, sep=";"),
+            f"summary_filtered_{datetime.now().strftime('%Y-%m-%d')}.csv",
+            "text/csv",
+            key="analyze_download_summary",
+        )
+
+
+def _autosave_and_notify() -> None:
+    """Zapisuje results timestamp + latest po zakończeniu joba."""
+    from src.core.results_io import autosave_results
+
+    results = st.session_state.results or []
+    if not results:
+        return
+    stamped, latest = autosave_results(results)
+    st.session_state.last_autosave_path = str(stamped)
+    st.success(
+        f"Zakończono — sprawdzono {len(results)} produktów. "
+        f"Autozapis: `{stamped}` (+ `{latest.name}`)."
+    )
 
 
 def _stop_job() -> None:
@@ -773,7 +973,7 @@ def process_job_tick() -> None:
         st.session_state.paused = False
         st.session_state.current_ean = None
         refresh_credits_info()
-        st.success(f"Zakończono — sprawdzono {len(st.session_state.results)} produktów.")
+        _autosave_and_notify()
         return
 
     product = products[idx]
@@ -790,7 +990,7 @@ def process_job_tick() -> None:
         st.session_state.paused = False
         st.session_state.current_ean = None
         refresh_credits_info()
-        st.success(f"Zakończono — sprawdzono {len(st.session_state.results)} produktów.")
+        _autosave_and_notify()
         st.rerun()
         return
 
@@ -799,13 +999,8 @@ def process_job_tick() -> None:
     st.rerun()
 
 
-def main():
-    st.title("📊 Allegro Price Monitor")
-    st.caption("Sprawdzanie cen i sprzedaży produktów na Allegro")
-
-    init_session_state()
-    sidebar_config()
-
+def scrape_tab() -> None:
+    """Zawartość zakładki Scrapowanie."""
     df = upload_section()
 
     can_start = True
@@ -840,6 +1035,7 @@ def main():
                 st.session_state.paused = False
                 st.session_state.running = True
                 st.session_state.selected_df = selected_df
+                st.session_state.last_autosave_path = None
                 if source == "scrape_do":
                     refresh_credits_info()
                 st.info(
@@ -873,10 +1069,24 @@ def main():
     results_section()
     process_job_tick()
 
+
+def main():
+    st.title("Allegro Price Monitor")
+    st.caption("Sprawdzanie cen i sprzedaży produktów na Allegro")
+
+    init_session_state()
+    sidebar_config()
+
+    tab_scrape, tab_analyze = st.tabs(["Scrapowanie", "Analiza wyników"])
+    with tab_scrape:
+        scrape_tab()
+    with tab_analyze:
+        analyze_section()
+
     client = get_scrape_client()
     if client and client.stats.total_requests > 0:
         st.sidebar.divider()
-        st.sidebar.subheader("📊 Sesja")
+        st.sidebar.subheader("Sesja")
         st.sidebar.caption(f"""
         Zapytań: {client.stats.total_requests}  
         Kredytów użyto: {client.stats.total_credits_used}  
@@ -886,7 +1096,7 @@ def main():
     st.sidebar.divider()
     st.sidebar.caption("""
     **Allegro Price Monitor**  
-    Wersja 1.2
+    Wersja 1.3
     
     Tryb konsolowy:
     ```
