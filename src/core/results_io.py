@@ -71,23 +71,36 @@ def offer_stats(product: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def format_status(status: Optional[str]) -> str:
+    """Status z ikoną do wyświetlenia w tabeli."""
+    labels = {
+        "checked": "✅ checked",
+        "error": "❌ error",
+        "pending": "⏳ pending",
+    }
+    if not status:
+        return ""
+    return labels.get(str(status), str(status))
+
+
 def summary_row(product: Dict[str, Any]) -> Dict[str, Any]:
     """Jeden wiersz tabeli podsumowania."""
     stats = offer_stats(product)
     return {
         "Kod": product.get("ean"),
         "Moja cena": product.get("my_price"),
-        "Znaleziono": "tak" if product.get("found_on_allegro") else "nie",
+        "Znaleziono": "✅ tak" if product.get("found_on_allegro") else "❌ nie",
         "Liczba ofert": stats["offers_count"],
         "Cena min": stats["min_price"],
         "Cena max": stats["max_price"],
         "Najtańsza oferta": stats["cheapest_title"],
         "Marża min %": stats["markup_min_pct"],
         "Pasujące": stats["matching_count"],
-        "Status": product.get("status"),
+        "Status": format_status(product.get("status")),
         "Cache": "tak" if product.get("from_cache") else "",
         "Błąd": product.get("error_message") or "",
     }
+
 
 
 def flatten_offers(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

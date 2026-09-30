@@ -683,6 +683,32 @@ def progress_section():
             st.metric("Błędów", errors)
 
 
+def results_columns_help(*, key: str = "results_columns_help") -> None:
+    """Pytajnik z objaśnieniem kolumn tabeli wyników."""
+    with st.popover(":material/help: Znaczenie kolumn"):
+        st.markdown(
+            """
+**Status**
+- ✅ **checked** — sprawdzenie się udało (scrape/API OK). *Nie* znaczy „pasuje cenowo”.
+- ❌ **error** — błąd zapytania (API, scrape.do, sieć); treść w kolumnie **Błąd**.
+- ⏳ **pending** — jeszcze nie sprawdzone.
+
+**Pasujące** — ile ofert spełnia *oba* filtry ze sidebara naraz:
+marża min–max względem Twojej ceny **oraz** min. kupujących.
+`0` często = cena poza progiem (np. +19% przy limicie 12–15%) albo brak `buyers_count`.
+
+**Błąd** — puste = OK. Komunikat tylko przy statusie error.
+
+**Marża min %** — ile % drożej jest *najtańsza* oferta Allegro względem **Moja cena**:
+`(cena_min / moja_cena − 1) × 100`.
+
+**Znaleziono** — czy listing zwrócił jakiekolwiek oferty (niezależnie od filtrów).
+
+**Liczba ofert / Cena min–max** — po deduplikacji `offer_id` z listingu.
+            """
+        )
+
+
 def results_section():
     """Sekcja wyników scrapowania — podsumowanie ofert + ekspandery."""
     from src.core.results_io import save_results_json, summary_row, offer_stats
@@ -690,7 +716,12 @@ def results_section():
     if not st.session_state.results:
         return
 
-    st.header("Wyniki")
+    head_l, head_r = st.columns([4, 1])
+    with head_l:
+        st.header("Wyniki")
+    with head_r:
+        results_columns_help(key="scrape_results_help")
+
     results = st.session_state.results
 
     rows = [summary_row(r) for r in results]
@@ -701,18 +732,20 @@ def results_section():
         show_only_matching = st.checkbox(
             "Tylko z pasującymi (wg filtrów scrapa)",
             key="scrape_only_matching",
+            help="Pokazuje wiersze, gdzie Pasujące > 0 (filtry marży i kupujących z sidebara).",
         )
     with filter_col2:
         show_only_found = st.checkbox(
             "Tylko znalezione na Allegro",
             key="scrape_only_found",
+            help="Ukrywa produkty bez żadnej oferty na listingu.",
         )
 
     view = df
     if show_only_matching:
         view = view[view["Pasujące"] > 0]
     if show_only_found:
-        view = view[view["Znaleziono"] == "tak"]
+        view = view[view["Znaleziono"].astype(str).str.contains("tak", case=False, na=False)]
 
     st.dataframe(view, width="stretch")
 
@@ -889,6 +922,12 @@ def analyze_section():
     )
 
     st.metric("Po filtrach", f"{len(filtered)} / {len(products)}")
+
+    a_l, a_r = st.columns([4, 1])
+    with a_l:
+        st.subheader("Podsumowanie")
+    with a_r:
+        results_columns_help(key="analyze_results_help")
 
     summary_df = pd.DataFrame([summary_row(p) for p in filtered])
     st.dataframe(summary_df, width="stretch")
