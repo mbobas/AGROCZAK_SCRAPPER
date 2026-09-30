@@ -8,6 +8,9 @@ from datetime import datetime
 import json
 import time
 import threading
+import warnings
+
+warnings.filterwarnings('ignore')
 
 # Dodaj sciezke
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -18,6 +21,7 @@ import pandas as pd
 from src.core.processor import ProductProcessor, ProcessorConfig, InputProduct, ProductResult
 from src.core.cache import ProductCache
 from src.api.allegro import AllegroClient, AllegroAPIError
+from src.api.scraper import ScrapeDoClient, ScraperError
 
 
 st.set_page_config(
@@ -41,6 +45,31 @@ def init_session_state():
         st.session_state.total = 0
     if "config" not in st.session_state:
         st.session_state.config = ProcessorConfig.from_yaml()
+    if "scrape_client" not in st.session_state:
+        st.session_state.scrape_client = None
+    if "credits_info" not in st.session_state:
+        st.session_state.credits_info = None
+
+
+def get_scrape_client():
+    """Pobiera lub tworzy klienta scrape.do."""
+    if st.session_state.scrape_client is None:
+        try:
+            st.session_state.scrape_client = ScrapeDoClient()
+        except ValueError:
+            return None
+    return st.session_state.scrape_client
+
+
+def refresh_credits_info():
+    """Odświeża informacje o kredytach (max 10/min)."""
+    client = get_scrape_client()
+    if client:
+        info = client.get_credits_info()
+        if "error" not in info:
+            st.session_state.credits_info = info
+            return info
+    return None
 
 
 def sidebar_config():
@@ -100,6 +129,59 @@ def sidebar_config():
         cache.clear_all()
         st.sidebar.success("Cache wyczyszczony!")
         st.rerun()
+    
+    # Kredyty scrape.do
+    st.sidebar.divider()
+    st.sidebar.subheader("💳 Kredyty scrape.do")
+    
+    client = get_scrape_client()
+    if client:
+        # Pokaż ostatnie znane dane lub odśwież
+        if st.session_state.credits_info:
+            info = st.session_state.credits_info
+        else:
+            info = refresh_credits_info()
+        
+        if info and "error" not in info:
+            remaining = info.get('RemainingMonthlyRequest', 0)
+            max_credits = info.get('MaxMonthlyRequest', 1000)
+            used = max_credits - remaining
+            usage_pct = (used / max_credits * 100) if max_credits > 0 else 0
+            
+            # Metryki
+            col1, col2 = st.sidebar.columns(2)
+            with col1:
+                st.metric("Pozostało", f"{remaining:,}")
+            with col2:
+                st.metric("Użyto", f"{used:,}")
+            
+            # Pasek postępu zużycia
+            st.sidebar.progress(min(usage_pct / 100, 1.0))
+            st.sidebar.caption(f"Zużycie: {usage_pct:.1f}% ({used:,} / {max_credits:,})")
+            
+            # Limit równoczesnych
+            concurrent = info.get('RemainingConcurrentRequest', 0)
+            st.sidebar.caption(f"Równoczesne zapytania: {concurrent}")
+            
+            # Koszty
+            st.sidebar.caption("""
+            **Koszty:**
+            - render=true: 5 kred./zapytanie
+            - render=false: 1 kred./zapytanie
+            """)
+        else:
+            st.sidebar.warning("Nie można pobrać info o kredytach")
+        
+        # Przycisk odświeżania (max 10/min)
+        if st.sidebar.button("🔄 Odśwież kredyty"):
+            new_info = refresh_credits_info()
+            if new_info and "error" not in new_info:
+                st.sidebar.success("Odświeżono!")
+            else:
+                st.sidebar.error(new_info.get("error", "Błąd") if new_info else "Błąd")
+            st.rerun()
+    else:
+        st.sidebar.warning("Brak tokena scrape.do w .env")
 
 
 def upload_section():
@@ -135,6 +217,41 @@ def upload_section():
             st.error(f"Błąd wczytywania: {e}")
     
     return None
+
+
+def cost_estimate_section(num_products: int):
+    """Sekcja szacowania kosztów."""
+    client = get_scrape_client()
+    if not client or num_products == 0:
+        return True
+    
+    st.subheader("💰 Szacowany koszt")
+    
+    # Szacuj koszty
+    estimate = client.estimate_cost(num_products, render=True)
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.metric("Produktów", num_products)
+    
+    with col2:
+        st.metric("Koszt (kredyty)", estimate['total_cost'])
+    
+    with col3:
+        remaining = estimate['remaining_credits']
+        if remaining is not None:
+            st.metric("Pozostanie", remaining - estimate['total_cost'])
+    
+    # Sprawdź czy wystarczy kredytów
+    if estimate['enough_credits'] is False:
+        st.error(f"⚠️ Za mało kredytów! Potrzebujesz {estimate['total_cost']}, masz {remaining}")
+        st.info(f"Możesz sprawdzić max {estimate['can_process']} produktów")
+        return False
+    elif estimate['enough_credits']:
+        st.success(f"✅ Wystarczająco kredytów ({remaining} dostępnych)")
+    
+    return True
 
 
 def control_section():
@@ -261,15 +378,26 @@ def main():
     # Upload
     df = upload_section()
     
+    # Szacowanie kosztów (jeśli wczytano plik)
+    can_start = True
+    if df is not None and len(df) > 0:
+        can_start = cost_estimate_section(len(df))
+    
     # Kontrola
     start_btn, pause_btn, resume_btn, stop_btn = control_section()
     
-    if start_btn and df is not None:
+    if start_btn and df is not None and can_start:
         st.session_state.running = True
         st.session_state.results = []
         st.session_state.total = len(df)
         st.session_state.progress = 0
+        
+        # Odśwież kredyty po starcie
+        refresh_credits_info()
+        
         st.info("Przetwarzanie rozpoczęte... (odśwież stronę, aby zobaczyć postęp)")
+    elif start_btn and not can_start:
+        st.error("Nie można rozpocząć - za mało kredytów!")
     
     if stop_btn:
         st.session_state.running = False
@@ -281,15 +409,26 @@ def main():
     # Wyniki
     results_section()
     
+    # Statystyki sesji scrape.do
+    client = get_scrape_client()
+    if client and client.stats.total_requests > 0:
+        st.sidebar.divider()
+        st.sidebar.subheader("📊 Sesja")
+        st.sidebar.caption(f"""
+        Zapytań: {client.stats.total_requests}  
+        Kredytów użyto: {client.stats.total_credits_used}  
+        Ostatni koszt: {client.stats.last_request_cost}
+        """)
+    
     # Info
     st.sidebar.divider()
     st.sidebar.caption("""
     **Allegro Price Monitor**  
-    Wersja 1.0
+    Wersja 1.1
     
     Tryb konsolowy:
     ```
-    python src/main.py run -i plik.csv
+    python src/main.py run -i plik.csv -s scrape_do
     ```
     """)
 

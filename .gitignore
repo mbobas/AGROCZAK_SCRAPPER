@@ -1,9 +1,29 @@
+# Środowisko
 .env
+!.env.example
+
+# Python
 __pycache__/
 *.pyc
+*.pyo
 .venv/
 venv/
+*.egg-info/
+
+# Dane wyjściowe i cache
 data/output/
+data/cache.db
 *.log
+
+# IDE
 .idea/
 .vscode/
+*.swp
+*.swo
+
+# System
+.DS_Store
+Thumbs.db
+
+# Testy - duże pliki HTML
+data/output/*.html

@@ -1,41 +1,89 @@
 # Allegro Price Monitor
 
-Aplikacja do monitorowania cen i sprzedaży produktów na Allegro.
+Aplikacja do monitorowania cen i sprzedaży produktów na Allegro na podstawie kodów EAN.
+
+## Funkcje
+
+- Wyszukiwanie produktów po kodzie EAN
+- Sprawdzanie cen na Allegro
+- Informacja o sprzedaży ("X osób kupiło")
+- Filtrowanie po marży cenowej (np. 12-15%)
+- Cache wyników (SQLite)
+- Tryb konsolowy i GUI (Streamlit)
+- Śledzenie zużycia kredytów scrape.do
 
 ## Wymagania
 
 - Python 3.10+
-- Credentiale Allegro API (client_id, client_secret)
-- Opcjonalnie: token scrape.do
+- Konto scrape.do (darmowe: 1000 kredytów/miesiąc)
+- Opcjonalnie: credentiale Allegro API
 
 ## Instalacja
 
+### Windows
+
+```powershell
+# Utwórz wirtualne środowisko
+python -m venv .venv
+
+# Aktywuj środowisko
+.\.venv\Scripts\Activate.ps1
+
+# Zainstaluj zależności
+pip install -r requirements.txt
+```
+
+### Linux / macOS
+
 ```bash
+# Utwórz wirtualne środowisko
+python3 -m venv .venv
+
+# Aktywuj środowisko
+source .venv/bin/activate
+
+# Zainstaluj zależności
 pip install -r requirements.txt
 ```
 
 ## Konfiguracja
 
-1. Skopiuj `.env.example` do `.env` i uzupełnij credentiale:
+1. Skopiuj `.env.example` do `.env`:
 
-```env
-ALLEGRO_CLIENT_ID=twoj_client_id
-ALLEGRO_CLIENT_SECRET=twoj_client_secret
-SCRAPE_DO_TOKEN=twoj_token  # opcjonalnie
+```bash
+cp .env.example .env
 ```
 
-2. Dostosuj `config.yaml` według potrzeb.
+2. Uzupełnij token scrape.do w pliku `.env`:
+
+```env
+SCRAPE_DO_TOKEN=twoj_token_z_scrape_do
+```
+
+3. (Opcjonalnie) Dostosuj `config.yaml`:
+
+```yaml
+price_threshold:
+  min_markup: 0.12  # 12%
+  max_markup: 0.15  # 15%
+
+sales_threshold:
+  min_buyers: 1     # minimum "X osób kupiło"
+
+cache:
+  ttl_days: 7       # ważność danych w dniach
+```
 
 ## Użycie
 
 ### Tryb konsolowy
 
 ```bash
-# Uruchom testy połączenia
+# Test połączenia
 python src/main.py test
 
 # Sprawdź produkty z pliku CSV
-python src/main.py run -i data/input/produkty.csv -o wyniki.json
+python src/main.py run -i data/input/produkty.csv -s scrape_do
 
 # Zarządzanie cache
 python src/main.py cache stats
@@ -48,9 +96,11 @@ python src/main.py cache clear-expired
 streamlit run src/gui/dashboard.py
 ```
 
+Otworzy się przeglądarka z interfejsem na `http://localhost:8501`
+
 ## Format pliku wejściowego
 
-CSV z separatorem `;`:
+Plik CSV z separatorem `;`:
 
 ```csv
 ean;cena;nazwa
@@ -58,18 +108,33 @@ ean;cena;nazwa
 5060512512509;50.00;Produkt 2
 ```
 
+Kolumny:
+- `ean` / `EAN` / `kod` / `code` - kod EAN produktu (wymagane)
+- `cena` / `price` / `my_price` - Twoja cena (wymagane)
+- `nazwa` / `name` - nazwa produktu (opcjonalne)
+
+## Koszty scrape.do
+
+| Tryb | Kredyty/zapytanie | Uwagi |
+|------|-------------------|-------|
+| `render=true` | 5 | Z JavaScript - pełne dane |
+| `render=false` | 1 | Bez JS - może brakować danych |
+
+Darmowy plan: **1000 kredytów/miesiąc** = ~200 produktów z pełnymi danymi
+
 ## Struktura projektu
 
 ```
 AGROCZAK_SCRAPPER/
 ├── .env                    # Credentiale (nie commituj!)
+├── .env.example            # Szablon credentiali
 ├── config.yaml             # Konfiguracja aplikacji
 ├── requirements.txt        # Zależności Python
 ├── src/
 │   ├── main.py            # Punkt wejścia CLI
 │   ├── api/
 │   │   ├── allegro.py     # Klient API Allegro
-│   │   └── scraper.py     # Scraper (scrape.do)
+│   │   └── scraper.py     # scrape.do + parser HTML
 │   ├── core/
 │   │   ├── processor.py   # Logika przetwarzania
 │   │   └── cache.py       # Cache wyników (SQLite)
@@ -78,12 +143,26 @@ AGROCZAK_SCRAPPER/
 ├── data/
 │   ├── input/             # Pliki wejściowe
 │   └── output/            # Wyniki
-└── tests/
-    └── test_api.py        # Testy
+└── tests/                 # Testy
 ```
 
-## Uwagi
+## Rozwiązywanie problemów
 
-- **API Allegro `/offers/listing`**: Endpoint do wyszukiwania publicznych ofert jest dostępny tylko dla zweryfikowanych aplikacji. Jeśli otrzymujesz błąd 403, użyj trybu scrape.do.
-- **Rate limiting**: Domyślnie 10 zapytań na minutę (6s opóźnienia). Dostosuj w `config.yaml`.
-- **Cache**: Wyniki są cache'owane w SQLite (domyślnie 7 dni ważności).
+### Windows: Błąd SSL
+```
+SSLError: certificate verify failed
+```
+Aplikacja automatycznie pomija weryfikację SSL dla scrape.do na Windows.
+
+### Brak kredytów scrape.do
+```
+401: You have no credits
+```
+Sprawdź stan konta na https://scrape.do/dashboard
+
+### API Allegro zwraca 403
+Endpoint `/offers/listing` wymaga weryfikacji aplikacji, która jest obecnie wstrzymana przez Allegro. Użyj trybu `scrape_do`.
+
+## Licencja
+
+Prywatne użycie.

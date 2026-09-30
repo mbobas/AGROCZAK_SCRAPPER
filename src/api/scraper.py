@@ -4,8 +4,9 @@ Scraper do Allegro - scrape.do lub wlasny scraper.
 import os
 import re
 import json
-from dataclasses import dataclass
-from typing import Optional, List
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Optional, List, Dict, Any
 from urllib.parse import quote_plus
 import requests
 from dotenv import load_dotenv
@@ -26,25 +27,108 @@ class OfferData:
     delivery_price: Optional[float] = None
 
 
+@dataclass
+class ScrapeStats:
+    """Statystyki zużycia scrape.do."""
+    total_requests: int = 0
+    total_credits_used: int = 0
+    remaining_credits: Optional[int] = None
+    max_monthly_credits: Optional[int] = None
+    concurrent_limit: Optional[int] = None
+    last_request_cost: Optional[int] = None
+    last_updated: Optional[str] = None
+    requests_history: List[Dict[str, Any]] = field(default_factory=list)
+    
+    def to_dict(self) -> dict:
+        return {
+            "total_requests": self.total_requests,
+            "total_credits_used": self.total_credits_used,
+            "remaining_credits": self.remaining_credits,
+            "max_monthly_credits": self.max_monthly_credits,
+            "concurrent_limit": self.concurrent_limit,
+            "last_request_cost": self.last_request_cost,
+            "last_updated": self.last_updated,
+            "requests_history": self.requests_history[-100:],  # Ostatnie 100
+        }
+    
+    @property
+    def usage_percent(self) -> float:
+        if self.max_monthly_credits and self.remaining_credits is not None:
+            used = self.max_monthly_credits - self.remaining_credits
+            return (used / self.max_monthly_credits) * 100
+        return 0.0
+
+
 class ScraperError(Exception):
     pass
 
 
 class ScrapeDoClient:
-    """Klient do scrape.do API."""
+    """Klient do scrape.do API z śledzeniem zużycia."""
     
     BASE_URL = "https://api.scrape.do"
+    INFO_RATE_LIMIT = 10  # max 10 zapytań /info na minutę
     
     def __init__(self, token: Optional[str] = None, verify_ssl: bool = True):
         self.token = token or os.getenv("SCRAPE_DO_TOKEN")
         self.verify_ssl = verify_ssl
+        self.stats = ScrapeStats()
+        self._last_info_check: Optional[datetime] = None
+        
         if not self.token:
             raise ValueError("SCRAPE_DO_TOKEN musi byc ustawiony")
+    
+    def _make_request(self, url: str, params: dict = None, timeout: int = 60) -> requests.Response:
+        """Wykonuje request z obsługą SSL."""
+        try:
+            return requests.get(url, params=params, timeout=timeout, verify=self.verify_ssl)
+        except requests.exceptions.SSLError:
+            return requests.get(url, params=params, timeout=timeout, verify=False)
+    
+    def _update_stats_from_headers(self, response: requests.Response, url: str):
+        """Aktualizuje statystyki na podstawie headerów odpowiedzi."""
+        headers = response.headers
+        
+        # Koszt tego requestu
+        request_cost = headers.get('Scrape.do-Request-Cost') or headers.get('Scrape-Do-Request-Cost')
+        if request_cost:
+            try:
+                cost = int(request_cost)
+                self.stats.last_request_cost = cost
+                self.stats.total_credits_used += cost
+            except ValueError:
+                pass
+        
+        # Pozostałe kredyty
+        remaining = headers.get('Scrape.do-Remaining-Credits') or headers.get('Scrape-Do-Remaining-Credits')
+        if remaining:
+            try:
+                self.stats.remaining_credits = int(remaining)
+            except ValueError:
+                pass
+        
+        # Aktualizuj historię
+        self.stats.total_requests += 1
+        self.stats.last_updated = datetime.now().isoformat()
+        self.stats.requests_history.append({
+            "timestamp": self.stats.last_updated,
+            "url": url[:100],
+            "cost": self.stats.last_request_cost,
+            "remaining": self.stats.remaining_credits,
+            "status": response.status_code,
+        })
+        
+        # Ogranicz historię do 100 wpisów
+        if len(self.stats.requests_history) > 100:
+            self.stats.requests_history = self.stats.requests_history[-100:]
     
     def scrape(self, url: str, render: bool = True) -> str:
         """
         Scrapuje strone przez scrape.do.
-        render=True uzywaj dla stron z JavaScript (kosztuje wiecej kredytow).
+        
+        Koszty:
+        - render=False: 1 kredyt (datacenter proxy)
+        - render=True: 5 kredytów (headless browser)
         """
         params = {
             "token": self.token,
@@ -52,27 +136,83 @@ class ScrapeDoClient:
             "render": str(render).lower(),
         }
         
-        try:
-            response = requests.get(self.BASE_URL, params=params, timeout=60, verify=self.verify_ssl)
-        except requests.exceptions.SSLError:
-            # Retry bez weryfikacji SSL (Windows issue)
-            response = requests.get(self.BASE_URL, params=params, timeout=60, verify=False)
+        response = self._make_request(self.BASE_URL, params=params, timeout=60)
+        
+        # Aktualizuj statystyki z headerów
+        self._update_stats_from_headers(response, url)
         
         if response.status_code != 200:
             raise ScraperError(f"scrape.do zwrocil {response.status_code}: {response.text[:200]}")
         
         return response.text
     
-    def get_credits_info(self) -> dict:
-        """Sprawdza ile kredytow zostalo."""
+    def get_credits_info(self, force: bool = False) -> dict:
+        """
+        Sprawdza ile kredytów zostało.
+        
+        Ten endpoint NIE kosztuje kredytów, ale ma limit 10 zapytań/minutę.
+        Zwraca:
+            - IsActive: bool
+            - ConcurrentRequest: int
+            - MaxMonthlyRequest: int
+            - RemainingConcurrentRequest: int
+            - RemainingMonthlyRequest: int
+        """
         url = f"{self.BASE_URL}/info?token={self.token}"
-        try:
-            response = requests.get(url, timeout=10, verify=self.verify_ssl)
-        except requests.exceptions.SSLError:
-            response = requests.get(url, timeout=10, verify=False)
+        response = self._make_request(url, timeout=10)
+        
         if response.status_code == 200:
-            return response.json()
+            data = response.json()
+            
+            # Aktualizuj statystyki
+            self.stats.remaining_credits = data.get('RemainingMonthlyRequest')
+            self.stats.max_monthly_credits = data.get('MaxMonthlyRequest')
+            self.stats.concurrent_limit = data.get('ConcurrentRequest')
+            self.stats.last_updated = datetime.now().isoformat()
+            self._last_info_check = datetime.now()
+            
+            return data
+        elif response.status_code == 429:
+            return {"error": "Rate limit - max 10 zapytań/minutę na /info"}
         return {"error": f"Status {response.status_code}"}
+    
+    def get_usage_summary(self) -> dict:
+        """Zwraca podsumowanie zużycia."""
+        return {
+            "session": {
+                "requests": self.stats.total_requests,
+                "credits_used": self.stats.total_credits_used,
+                "last_cost": self.stats.last_request_cost,
+            },
+            "account": {
+                "remaining": self.stats.remaining_credits,
+                "max_monthly": self.stats.max_monthly_credits,
+                "usage_percent": round(self.stats.usage_percent, 1),
+            },
+            "last_updated": self.stats.last_updated,
+        }
+    
+    def estimate_cost(self, num_products: int, render: bool = True) -> dict:
+        """
+        Szacuje koszt sprawdzenia podanej liczby produktów.
+        
+        Koszty dla Allegro (nie jest na liście specjalnych domen):
+        - render=True: 5 kredytów/zapytanie
+        - render=False: 1 kredyt/zapytanie (ale może brakować danych)
+        """
+        cost_per_request = 5 if render else 1
+        total_cost = num_products * cost_per_request
+        
+        remaining = self.stats.remaining_credits
+        can_process = remaining // cost_per_request if remaining else None
+        
+        return {
+            "cost_per_request": cost_per_request,
+            "total_cost": total_cost,
+            "remaining_credits": remaining,
+            "can_process": can_process,
+            "enough_credits": remaining >= total_cost if remaining else None,
+        }
 
 
 def parse_allegro_search_html(html: str) -> List[OfferData]:
