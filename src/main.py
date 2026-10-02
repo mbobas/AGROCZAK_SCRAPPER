@@ -20,7 +20,7 @@ from src.core.cache import ProductCache
 console = Console()
 
 
-def create_data_fetcher():
+def create_data_fetcher(render: bool = True):
     """Tworzy funkcje do pobierania danych przez scrape.do."""
     try:
         from src.api.scraper import create_scrape_fetcher, ScrapeDoClient
@@ -31,12 +31,15 @@ def create_data_fetcher():
         info = client.get_credits_info()
         remaining = info.get('RemainingMonthlyRequest', 0)
         console.print(f"[dim]scrape.do: {remaining} kredytow pozostalo[/dim]")
+        console.print(
+            f"[dim]render={'ON (~5 kred.)' if render else 'OFF (~1 kred.)'}[/dim]"
+        )
 
         if remaining < 10:
             console.print("[red]Za malo kredytow scrape.do![/red]")
             return None
 
-        return create_scrape_fetcher(render=True)
+        return create_scrape_fetcher(render=render)
 
     except Exception as e:
         console.print(f"[yellow]scrape.do niedostepne: {e}[/yellow]")
@@ -60,7 +63,14 @@ def run_console_mode(args):
     console.print(f"[dim]Konfiguracja: markup {config.min_markup*100:.0f}-{config.max_markup*100:.0f}%, "
                   f"min kupujacych: {config.min_buyers}, TTL: {config.ttl_days} dni[/dim]")
 
-    fetcher = create_data_fetcher()
+    render = not getattr(args, "no_render", False)
+    if not render:
+        console.print(
+            "[yellow]Uwaga: --no-render — taniej (~1 kred.), ale Allegro moze zwrocic "
+            "mniej ofert albo bez liczby kupujacych; czasem 0 wynikow.[/yellow]"
+        )
+
+    fetcher = create_data_fetcher(render=render)
     if not fetcher:
         console.print("[red]Nie mozna utworzyc polaczenia ze scrape.do![/red]")
         console.print("[yellow]Sprawdz SCRAPE_DO_TOKEN w pliku .env[/yellow]")
@@ -130,6 +140,11 @@ def main():
     run_parser.add_argument("-i", "--input", required=True, help="Plik CSV z produktami (EAN;cena)")
     run_parser.add_argument("-o", "--output", help="Plik wyjsciowy JSON (domyslnie: data/output/results_DATA.json)")
     run_parser.add_argument("-c", "--config", default="config.yaml", help="Plik konfiguracji")
+    run_parser.add_argument(
+        "--no-render",
+        action="store_true",
+        help="Bez headless JS (~1 kred./kod zamiast ~5). Moze dac mniej ofert / bez kupujacych.",
+    )
 
     subparsers.add_parser("test", help="Testuj polaczenie ze scrape.do")
     subparsers.add_parser("gui", help="Uruchom interfejs graficzny")

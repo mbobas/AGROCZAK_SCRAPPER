@@ -65,6 +65,8 @@ def init_session_state():
     if "current_ean" not in st.session_state:
         st.session_state.current_ean = None
     st.session_state.data_source = "scrape_do"
+    if "use_render" not in st.session_state:
+        st.session_state.use_render = True
     if "last_autosave_path" not in st.session_state:
         st.session_state.last_autosave_path = None
     if "analyze_products" not in st.session_state:
@@ -125,14 +127,17 @@ def build_data_fetcher():
     """
     Tworzy data_fetcher przez scrape.do (jedyny tryb).
     Reuse'uje ScrapeDoClient z sesji (spójne kredyty).
+    Render bierze z st.session_state.use_render.
     """
     client = get_scrape_client()
     if client is None:
         st.error("Brak tokena scrape.do w .env — nie można uruchomić scrapowania.")
         return None
 
+    render = bool(st.session_state.get("use_render", True))
+
     def fetch_scrape(ean: str) -> list[dict]:
-        offers = search_allegro_by_ean(ean, client, render=True)
+        offers = search_allegro_by_ean(ean, client, render=render)
         return [
             {
                 "offer_id": o.offer_id,
@@ -256,6 +261,19 @@ def sidebar_config():
     st.sidebar.caption("Zablokowane: **scrape.do** (listing Allegro jak w przeglądarce).")
     st.session_state.data_source = "scrape_do"
 
+    st.sidebar.toggle(
+        "Render JS (headless)",
+        key="use_render",
+        help="ON ≈ 5 kred./kod (pełniejszy listing). OFF ≈ 1 kred./kod (tańszy, mniej wiarygodny).",
+    )
+    if st.session_state.use_render:
+        st.sidebar.caption("~5 kred./kod — pełniejszy listing (zalecane).")
+    else:
+        st.sidebar.warning(
+            "Bez renderu taniej (~1 kred.), ale Allegro może zwrócić mniej ofert "
+            "albo bez liczby kupujących; czasem 0 wyników mimo że na stronie coś jest."
+        )
+
     # Cache stats
     st.sidebar.subheader("📦 Cache")
     cache = ProductCache()
@@ -316,12 +334,15 @@ def sidebar_config():
             concurrent = info.get('RemainingConcurrentRequest', 0)
             st.sidebar.caption(f"Równoczesne zapytania: {concurrent}")
             
-            # Koszty
-            st.sidebar.caption("""
-            **Koszty:**
-            - render=true: 5 kred./zapytanie
-            - render=false: 1 kred./zapytanie
-            """)
+            # Koszty — aktywny tryb
+            active = st.session_state.get("use_render", True)
+            if active:
+                st.sidebar.caption("**Aktywny tryb:** render ON → ~5 kred./zapytanie")
+            else:
+                st.sidebar.caption("**Aktywny tryb:** render OFF → ~1 kred./zapytanie")
+            st.sidebar.caption(
+                "Cennik: render=true = 5 kred. · render=false = 1 kred."
+            )
         else:
             st.sidebar.warning("Nie można pobrać info o kredytach")
         
@@ -428,7 +449,8 @@ def range_section(df: pd.DataFrame) -> pd.DataFrame:
             max_monthly = info.get("MaxMonthlyRequest")
             if max_monthly is not None:
                 client.stats.max_monthly_credits = max_monthly
-        estimate = client.estimate_cost(1, render=True)
+        use_render = bool(st.session_state.get("use_render", True))
+        estimate = client.estimate_cost(1, render=use_render)
         can_process = estimate.get("can_process")
     st.session_state.range_can_process = can_process
 
@@ -510,33 +532,37 @@ def cost_estimate_section(num_products: int):
     client = get_scrape_client()
     if not client or num_products == 0:
         return True
-    
+
     st.subheader("💰 Szacowany koszt")
-    
-    # Szacuj koszty
-    estimate = client.estimate_cost(num_products, render=True)
-    
+
+    use_render = bool(st.session_state.get("use_render", True))
+    estimate = client.estimate_cost(num_products, render=use_render)
+    cost_per = estimate.get("cost_per_request", 5 if use_render else 1)
+    st.caption(
+        f"Tryb: render={'ON' if use_render else 'OFF'} "
+        f"(~{cost_per} kred./produkt)"
+    )
+
     col1, col2, col3 = st.columns(3)
-    
+
     with col1:
         st.metric("Produktów", num_products)
-    
+
     with col2:
         st.metric("Koszt (kredyty)", estimate['total_cost'])
-    
+
     with col3:
         remaining = estimate['remaining_credits']
         if remaining is not None:
             st.metric("Pozostanie", remaining - estimate['total_cost'])
-    
-    # Sprawdź czy wystarczy kredytów
+
     if estimate['enough_credits'] is False:
         st.error(f"⚠️ Za mało kredytów! Potrzebujesz {estimate['total_cost']}, masz {remaining}")
         st.info(f"Możesz sprawdzić max {estimate['can_process']} produktów")
         return False
     elif estimate['enough_credits']:
         st.success(f"✅ Wystarczająco kredytów ({remaining} dostępnych)")
-    
+
     return True
 
 
@@ -1027,10 +1053,11 @@ def scrape_tab() -> None:
                 st.session_state.selected_df = selected_df
                 st.session_state.last_autosave_path = None
                 refresh_credits_info()
+                render_label = "on" if st.session_state.get("use_render", True) else "off"
                 st.info(
                     f"Przetwarzanie wierszy "
                     f"{st.session_state.range_start}–{st.session_state.range_end} "
-                    f"({len(products)} produktów, źródło: scrape.do)."
+                    f"({len(products)} produktów, źródło: scrape.do, render={render_label})."
                 )
     elif start_btn and selected_df is None:
         st.error("Najpierw wczytaj plik CSV.")
