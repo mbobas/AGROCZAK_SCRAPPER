@@ -94,8 +94,11 @@ def run_console_mode(args):
 
     output_path = args.output
     if not output_path:
+        from src.core.results_io import search_mode_suffix
+
         date_str = datetime.now().strftime("%Y-%m-%d_%H%M")
-        output_path = f"data/output/results_{date_str}.json"
+        suffix = search_mode_suffix(processor.search_mode)
+        output_path = f"data/output/results_{date_str}{suffix}.json"
 
     processor.save_results(output_path, results)
     console.print(f"\n[green]Wyniki zapisane do: {output_path}[/green]")
@@ -138,7 +141,11 @@ def main():
 
     run_parser = subparsers.add_parser("run", help="Uruchom sprawdzanie produktow")
     run_parser.add_argument("-i", "--input", required=True, help="Plik CSV z produktami (EAN;cena)")
-    run_parser.add_argument("-o", "--output", help="Plik wyjsciowy JSON (domyslnie: data/output/results_DATA.json)")
+    run_parser.add_argument(
+        "-o",
+        "--output",
+        help="Plik wyjsciowy JSON (domyslnie: data/output/results_DATA_szukanie_po_kodzie|nazwie.json)",
+    )
     run_parser.add_argument("-c", "--config", default="config.yaml", help="Plik konfiguracji")
     run_parser.add_argument(
         "--render",

@@ -6,17 +6,35 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from .matching import code_in_title, name_match_pct
 
 OUTPUT_DIR = Path("data/output")
-LATEST_NAME = "results_latest.json"
 
 
 def ensure_output_dir() -> Path:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     return OUTPUT_DIR
+
+
+def search_mode_suffix(mode: Optional[str]) -> str:
+    """Suffix nazwy pliku: _szukanie_po_kodzie | _szukanie_po_nazwie."""
+    if str(mode or "").strip().lower() in {"name", "nazwa"}:
+        return "_szukanie_po_nazwie"
+    return "_szukanie_po_kodzie"
+
+
+def infer_search_mode(results: List[Any]) -> str:
+    """Tryb z pierwszego produktu z polem search_mode; domyślnie code."""
+    for item in results or []:
+        if isinstance(item, dict):
+            mode = item.get("search_mode")
+        else:
+            mode = getattr(item, "search_mode", None)
+        if mode in ("code", "name"):
+            return str(mode)
+    return "code"
 
 
 def dedupe_offers(offers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -324,12 +342,16 @@ def flatten_offers(
 def save_results_json(
     results: List[Dict[str, Any]],
     path: Optional[Path] = None,
+    *,
+    search_mode: Optional[str] = None,
 ) -> Path:
-    """Zapisuje wyniki do pliku timestampowanego (domyślnie)."""
+    """Zapisuje wyniki do pliku timestampowanego z suffixem trybu szukania."""
     ensure_output_dir()
     if path is None:
         stamp = datetime.now().strftime("%Y-%m-%d_%H%M")
-        path = OUTPUT_DIR / f"results_{stamp}.json"
+        mode = search_mode if search_mode is not None else infer_search_mode(results)
+        suffix = search_mode_suffix(mode)
+        path = OUTPUT_DIR / f"results_{stamp}{suffix}.json"
     else:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -345,16 +367,13 @@ def save_results_json(
     return path
 
 
-def save_results_latest(results: List[Dict[str, Any]]) -> Path:
-    """Nadpisuje results_latest.json."""
-    return save_results_json(results, path=OUTPUT_DIR / LATEST_NAME)
-
-
-def autosave_results(results: List[Dict[str, Any]]) -> Tuple[Path, Path]:
-    """Zapis timestamp + latest. Zwraca (timestamp_path, latest_path)."""
-    stamped = save_results_json(results)
-    latest = save_results_latest(results)
-    return stamped, latest
+def autosave_results(
+    results: List[Dict[str, Any]],
+    *,
+    search_mode: Optional[str] = None,
+) -> Path:
+    """Zapis timestampowanego JSON z suffixem trybu szukania."""
+    return save_results_json(results, search_mode=search_mode)
 
 
 def list_result_files() -> List[Path]:

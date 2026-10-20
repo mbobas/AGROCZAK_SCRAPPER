@@ -25,7 +25,7 @@ from src.api.scraper import ScrapeDoClient, search_allegro_by_ean
 
 
 st.set_page_config(
-    page_title="Allegro Price Monitor_v1.1",
+    page_title="Allegro Price Monitor",
     page_icon="📊",
     layout="wide"
 )
@@ -814,13 +814,17 @@ def results_section():
 
     st.caption(
         "Autozapis po zakończeniu scrapowania: `data/output/` "
-        "(timestamp + `results_latest.json`). Ręczne zapisywanie nadal dostępne."
+        "(`results_DATA_szukanie_po_kodzie|nazwie.json`). "
+        "Ręczne zapisywanie nadal dostępne."
     )
 
     col1, col2 = st.columns(2)
     with col1:
         if st.button("Zapisz wyniki JSON (pełne oferty)", key="manual_save_json"):
-            path = save_results_json(results)
+            mode = (
+                "name" if st.session_state.search_mode == "Nazwa" else "code"
+            )
+            path = save_results_json(results, search_mode=mode)
             st.success(f"Zapisano: {path}")
     with col2:
         csv = view.to_csv(index=False, sep=";")
@@ -1000,7 +1004,16 @@ def analyze_section():
     st.subheader("Eksport przefiltrowanych")
     ec1, ec2 = st.columns(2)
     with ec1:
-        if st.button("Zapisz przefiltrowane JSON", key="analyze_save_json"):
+        if st.button(
+            "Zapisz przefiltrowane JSON",
+            key="analyze_save_json",
+            help=(
+                "Zapisuje do data/output/ pełny format wyników (jak po scrapowaniu). "
+                "Tylko produkty przechodzące filtry; u każdego zostaje pełna lista ofert "
+                "(nie tylko te widoczne po filtrach). Da się znowu wczytać w Analizie. "
+                "Nie ściąga pliku do przeglądarki."
+            ),
+        ):
             path = save_results_json(filtered)
             st.success(f"Zapisano: {path}")
     with ec2:
@@ -1011,6 +1024,10 @@ def analyze_section():
                 f"offers_filtered_{datetime.now().strftime('%Y-%m-%d')}.csv",
                 "text/csv",
                 key="analyze_download_csv",
+                help=(
+                    "Pobiera tabelę „Oferty spłaszczone”: jedna oferta = jeden wiersz, "
+                    "tylko oferty spełniające bieżące filtry (marża, kupujący, dopasowanie)."
+                ),
             )
         st.download_button(
             "Pobierz podsumowanie CSV",
@@ -1018,21 +1035,26 @@ def analyze_section():
             f"summary_filtered_{datetime.now().strftime('%Y-%m-%d')}.csv",
             "text/csv",
             key="analyze_download_summary",
+            help=(
+                "Pobiera tabelę „Podsumowanie”: jeden produkt = jeden wiersz "
+                "(liczba ofert, cena min/max itd. liczone po bieżących filtrach)."
+            ),
         )
 
 
 def _autosave_and_notify() -> None:
-    """Zapisuje results timestamp + latest po zakończeniu joba."""
+    """Zapisuje results z suffixem trybu szukania po zakończeniu joba."""
     from src.core.results_io import autosave_results
 
     results = st.session_state.results or []
     if not results:
         return
-    stamped, latest = autosave_results(results)
+    mode = "name" if st.session_state.search_mode == "Nazwa" else "code"
+    stamped = autosave_results(results, search_mode=mode)
     st.session_state.last_autosave_path = str(stamped)
     st.success(
         f"Zakończono — sprawdzono {len(results)} produktów. "
-        f"Autozapis: `{stamped}` (+ `{latest.name}`)."
+        f"Autozapis: `{stamped}`."
     )
 
 

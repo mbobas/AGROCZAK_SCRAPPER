@@ -99,9 +99,21 @@ def test_min_offers_counts_filtered_offers(product):
 
 
 def test_regression_latest_results():
-    path = Path("data/output/results_latest.json")
-    if not path.exists():
-        pytest.skip("brak results_latest.json")
+    out = Path("data/output")
+    candidates = sorted(
+        out.glob("results_*_szukanie_po_*.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not candidates:
+        candidates = sorted(
+            out.glob("results_*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    if not candidates:
+        pytest.skip("brak results_*.json w data/output")
+    path = candidates[0]
     data = json.loads(path.read_text(encoding="utf-8"))
     products = data["products"] if isinstance(data, dict) else data
     rows = flatten_offers(products, markup_min_pct=0, markup_max_pct=9)

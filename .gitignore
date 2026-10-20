@@ -11,7 +11,7 @@ venv/
 *.egg-info/
 
 # Dane wyjściowe i cache
-data/output/
+# data/output/
 data/cache.db
 data/logs/
 *.log
