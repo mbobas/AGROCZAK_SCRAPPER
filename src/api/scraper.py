@@ -4,6 +4,7 @@ Scraper do Allegro - scrape.do lub wlasny scraper.
 import os
 import re
 import json
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional, List, Dict, Any
@@ -12,6 +13,12 @@ import requests
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Allegro: w praktyce jak residential (super) — Usage History i Request Costs scrape.do
+ALLEGRO_CREDITS_RENDER_OFF = 10
+ALLEGRO_CREDITS_RENDER_ON = 25
+DEFAULT_GEO_CODE = "pl"
+REQUEST_HEADERS = {"Accept-Encoding": "gzip, deflate, br"}
 
 
 @dataclass
@@ -74,76 +81,87 @@ class ScrapeDoClient:
         self.verify_ssl = verify_ssl
         self.stats = ScrapeStats()
         self._last_info_check: Optional[datetime] = None
-        
+        self._stats_lock = threading.Lock()
+
         if not self.token:
             raise ValueError("SCRAPE_DO_TOKEN musi byc ustawiony")
     
     def _make_request(self, url: str, params: dict = None, timeout: int = 60) -> requests.Response:
-        """Wykonuje request z obsługą SSL."""
+        """Wykonuje request z obsługą SSL i kompresją odpowiedzi."""
+        kwargs = {
+            "params": params,
+            "timeout": timeout,
+            "headers": REQUEST_HEADERS,
+            "verify": self.verify_ssl,
+        }
         try:
-            return requests.get(url, params=params, timeout=timeout, verify=self.verify_ssl)
+            return requests.get(url, **kwargs)
         except requests.exceptions.SSLError:
-            return requests.get(url, params=params, timeout=timeout, verify=False)
+            kwargs["verify"] = False
+            return requests.get(url, **kwargs)
     
     def _update_stats_from_headers(self, response: requests.Response, url: str):
-        """Aktualizuje statystyki na podstawie headerów odpowiedzi."""
+        """Aktualizuje statystyki na podstawie headerów odpowiedzi (thread-safe)."""
         headers = response.headers
-        
-        # Koszt tego requestu
-        request_cost = headers.get('Scrape.do-Request-Cost') or headers.get('Scrape-Do-Request-Cost')
-        if request_cost:
-            try:
-                cost = int(request_cost)
-                self.stats.last_request_cost = cost
-                self.stats.total_credits_used += cost
-            except ValueError:
-                pass
-        
-        # Pozostałe kredyty
-        remaining = headers.get('Scrape.do-Remaining-Credits') or headers.get('Scrape-Do-Remaining-Credits')
-        if remaining:
-            try:
-                self.stats.remaining_credits = int(remaining)
-            except ValueError:
-                pass
-        
-        # Aktualizuj historię
-        self.stats.total_requests += 1
-        self.stats.last_updated = datetime.now().isoformat()
-        self.stats.requests_history.append({
-            "timestamp": self.stats.last_updated,
-            "url": url[:100],
-            "cost": self.stats.last_request_cost,
-            "remaining": self.stats.remaining_credits,
-            "status": response.status_code,
-        })
-        
-        # Ogranicz historię do 100 wpisów
-        if len(self.stats.requests_history) > 100:
-            self.stats.requests_history = self.stats.requests_history[-100:]
+        with self._stats_lock:
+            request_cost = headers.get("Scrape.do-Request-Cost") or headers.get(
+                "Scrape-Do-Request-Cost"
+            )
+            if request_cost:
+                try:
+                    cost = int(request_cost)
+                    self.stats.last_request_cost = cost
+                    self.stats.total_credits_used += cost
+                except ValueError:
+                    pass
+
+            remaining = headers.get("Scrape.do-Remaining-Credits") or headers.get(
+                "Scrape-Do-Remaining-Credits"
+            )
+            if remaining:
+                try:
+                    self.stats.remaining_credits = int(remaining)
+                except ValueError:
+                    pass
+
+            self.stats.total_requests += 1
+            self.stats.last_updated = datetime.now().isoformat()
+            self.stats.requests_history.append(
+                {
+                    "timestamp": self.stats.last_updated,
+                    "url": url[:100],
+                    "cost": self.stats.last_request_cost,
+                    "remaining": self.stats.remaining_credits,
+                    "status": response.status_code,
+                }
+            )
+            if len(self.stats.requests_history) > 100:
+                self.stats.requests_history = self.stats.requests_history[-100:]
     
-    def scrape(self, url: str, render: bool = False) -> str:
+    def scrape(self, url: str, render: bool = False, geo_code: str = DEFAULT_GEO_CODE) -> str:
         """
         Scrapuje strone przez scrape.do.
-        
-        Koszty:
-        - render=False: 1 kredyt (datacenter proxy)
-        - render=True: 5 kredytów (headless browser)
+
+        Koszty Allegro (obserwowane / jak residential):
+        - render=False: ~10 kredytów
+        - render=True: ~25 kredytów (super + headless)
+        Autorytatywny koszt: header Scrape.do-Request-Cost.
         """
         params = {
             "token": self.token,
             "url": url,
             "render": str(render).lower(),
+            "geoCode": geo_code,
         }
-        
+
         response = self._make_request(self.BASE_URL, params=params, timeout=60)
-        
+
         # Aktualizuj statystyki z headerów
         self._update_stats_from_headers(response, url)
-        
+
         if response.status_code != 200:
             raise ScraperError(f"scrape.do zwrocil {response.status_code}: {response.text[:200]}")
-        
+
         return response.text
     
     def get_credits_info(self, force: bool = False) -> dict:
@@ -194,25 +212,35 @@ class ScrapeDoClient:
     
     def estimate_cost(self, num_products: int, render: bool = False) -> dict:
         """
-        Szacuje koszt sprawdzenia podanej liczby produktów.
-        
-        Koszty dla Allegro (nie jest na liście specjalnych domen):
-        - render=True: 5 kredytów/zapytanie
-        - render=False: 1 kredyt/zapytanie (ale może brakować danych)
+        Szacuje koszt sprawdzenia podanej liczby produktów na Allegro.
+
+        W praktyce Allegro rozliczane jak residential (super):
+        - render=False: 10 kredytów/zapytanie
+        - render=True: 25 kredytów/zapytanie
         """
-        cost_per_request = 5 if render else 1
+        cost_per_request = ALLEGRO_CREDITS_RENDER_ON if render else ALLEGRO_CREDITS_RENDER_OFF
         total_cost = num_products * cost_per_request
-        
+
         remaining = self.stats.remaining_credits
-        can_process = remaining // cost_per_request if remaining else None
-        
+        can_process = remaining // cost_per_request if remaining is not None else None
+
         return {
             "cost_per_request": cost_per_request,
             "total_cost": total_cost,
             "remaining_credits": remaining,
             "can_process": can_process,
-            "enough_credits": remaining >= total_cost if remaining else None,
+            "enough_credits": remaining >= total_cost if remaining is not None else None,
         }
+
+    def get_concurrency_limit(self, fallback: int = 5) -> int:
+        """Limit równoległych zapytań z /info lub ostatniego stats."""
+        if self.stats.concurrent_limit and self.stats.concurrent_limit > 0:
+            return int(self.stats.concurrent_limit)
+        info = self.get_credits_info()
+        limit = info.get("ConcurrentRequest") if isinstance(info, dict) else None
+        if limit and int(limit) > 0:
+            return int(limit)
+        return fallback
 
 
 def _extract_listing_store_state(html: str) -> tuple[list, dict]:
@@ -513,6 +541,7 @@ def search_allegro_by_ean(ean: str, scraper: ScrapeDoClient, render: bool = Fals
             "token": scraper.token,
             "url": search_url,
             "render": str(render).lower(),
+            "geoCode": DEFAULT_GEO_CODE,
         }
         response = scraper._make_request(scraper.BASE_URL, params=params, timeout=60)
         scraper._update_stats_from_headers(response, search_url)

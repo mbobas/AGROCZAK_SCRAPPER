@@ -9,8 +9,8 @@ cache:
   ttl_days: 30      # waznosc danych w dniach
 
 rate_limit:
-  requests_per_minute: 10  # bezpieczny limit
-  delay_between_requests: 6  # sekundy miedzy requestami
+  requests_per_minute: 10  # informacyjnie; realny limit = Concurrent z scrape.do
+  delay_between_requests: 0  # 0 przy rownoleglym scrapie; cache i tak bez delay
 
 data_source:
   primary: "scrape_do"  # jedyne zrodlo (API Allegro listing niedostepne)

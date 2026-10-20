@@ -134,14 +134,21 @@ Kolumny:
 - `cena` / `price` / `my_price` - Twoja cena (wymagane)
 - `nazwa` / `name` - nazwa produktu (opcjonalne)
 
-## Koszty scrape.do
+## Koszty scrape.do (Allegro)
+
+Dla Allegro w praktyce obowiązuje stawka jak **residential (`super`)**, nawet przy `render=false`
+(potwierdzone Usage History + [Request Costs](https://scrape.do/documentation/request-costs/)).
+Wiążący jest header `Scrape.do-Request-Cost`.
 
 | Tryb | Kredyty/zapytanie | Uwagi |
 |------|-------------------|-------|
-| `render=true` | 5 | Z JavaScript - pełne dane (włącz w sidebarze lub `--render` w CLI) |
-| `render=false` | 1 | Bez JS - **domyślnie**, może brakować danych |
+| `render=false` (domyślnie) | **~10** | Jak residential — najtańszy sensowny tryb na Allegro |
+| `render=true` | **~25** | Residential + headless — pełniejszy listing |
 
-Darmowy plan: **1000 kredytów/miesiąc** = ~1000 produktów (render OFF) lub ~200 (render ON)
+Aplikacja scrapuje **równolegle** do limitu **Concurrent Requests** z planu
+(np. Hobby = **10**). Cache: bulk odczyt, bez delay — ponowne kody w TTL ≈ 0 kred.
+
+Szacunek: 16 000 kodów × 10 ≈ **160 000** kredytów (pierwszy przebieg, render OFF).
 
 ### Tryb wyszukiwania (Kod / Nazwa)
 

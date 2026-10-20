@@ -4,10 +4,12 @@ Glowny procesor - logika przetwarzania listy produktow.
 import csv
 import json
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Callable
+from typing import List, Dict, Any, Optional, Callable, Tuple
 import yaml
 
 from .cache import ProductCache
@@ -21,7 +23,7 @@ class InputProduct:
     name: Optional[str] = None
 
 
-@dataclass 
+@dataclass
 class AllegroOffer:
     offer_id: str
     title: str
@@ -48,7 +50,7 @@ class ProductResult:
     from_cache: bool = False
     search_mode: str = "code"  # code | name
     search_query: Optional[str] = None
-    
+
     def to_dict(self) -> Dict[str, Any]:
         result = asdict(self)
         result["offers"] = [
@@ -73,8 +75,8 @@ class ProcessorConfig:
     max_markup: float = 0.50
     min_buyers: int = 0
     ttl_days: int = 30
-    delay_seconds: float = 6.0
-    
+    delay_seconds: float = 0.0
+
     @classmethod
     def from_yaml(cls, path: str = "config.yaml") -> "ProcessorConfig":
         try:
@@ -85,7 +87,9 @@ class ProcessorConfig:
                 max_markup=config.get("price_threshold", {}).get("max_markup", 0.50),
                 min_buyers=config.get("sales_threshold", {}).get("min_buyers", 0),
                 ttl_days=config.get("cache", {}).get("ttl_days", 30),
-                delay_seconds=config.get("rate_limit", {}).get("delay_between_requests", 6),
+                delay_seconds=float(
+                    config.get("rate_limit", {}).get("delay_between_requests", 0)
+                ),
             )
         except FileNotFoundError:
             return cls()
@@ -93,21 +97,25 @@ class ProcessorConfig:
 
 class ProductProcessor:
     """Glowny procesor do sprawdzania produktow na Allegro."""
-    
-    def __init__(self, config: Optional[ProcessorConfig] = None,
-                 data_fetcher: Optional[Callable] = None,
-                 search_mode: str = "code"):
+
+    def __init__(
+        self,
+        config: Optional[ProcessorConfig] = None,
+        data_fetcher: Optional[Callable] = None,
+        search_mode: str = "code",
+    ):
         self.search_mode = search_mode if search_mode in ("code", "name") else "code"
         self.config = config or ProcessorConfig.from_yaml()
         self.cache = ProductCache()
         self.data_fetcher = data_fetcher  # funkcja do pobierania danych z Allegro
-        
+
         self._running = False
         self._paused = False
         self._current_index = 0
         self._results: List[ProductResult] = []
         self._progress_callback: Optional[Callable] = None
-    
+        self._state_lock = threading.Lock()
+
     def load_input_csv(self, path: str) -> List[InputProduct]:
         """Wczytuje liste produktow z CSV."""
         products = []
@@ -117,26 +125,28 @@ class ProductProcessor:
                 ean = row.get("ean") or row.get("EAN") or row.get("kod") or row.get("code", "")
                 price = row.get("cena") or row.get("price") or row.get("my_price", "0")
                 name = row.get("nazwa") or row.get("name", "")
-                
+
                 try:
                     price_float = float(str(price).replace(",", ".").replace(" ", ""))
                 except ValueError:
                     price_float = 0.0
-                
+
                 if ean:
-                    products.append(InputProduct(
-                        ean=ean.strip(),
-                        my_price=price_float,
-                        name=name.strip() if name else None
-                    ))
+                    products.append(
+                        InputProduct(
+                            ean=ean.strip(),
+                            my_price=price_float,
+                            name=name.strip() if name else None,
+                        )
+                    )
         return products
-    
+
     def check_price_match(self, my_price: float, allegro_price: float) -> bool:
         """Sprawdza czy cena Allegro jest w przedziale marży (config)."""
         min_price = my_price * (1 + self.config.min_markup)
         max_price = my_price * (1 + self.config.max_markup)
         return min_price <= allegro_price <= max_price
-    
+
     def check_sales(self, buyers_count: Optional[int]) -> bool:
         """Sprawdza czy produkt sie sprzedaje. min_buyers<=0 = bez wymogu (null OK)."""
         if self.config.min_buyers <= 0:
@@ -144,8 +154,66 @@ class ProductProcessor:
         if buyers_count is None:
             return False
         return buyers_count >= self.config.min_buyers
-    
-    def process_single(self, product: InputProduct) -> ProductResult:
+
+    def _cache_key_and_query(self, product: InputProduct) -> Tuple[str, Optional[str]]:
+        if self.search_mode == "name":
+            query = build_search_query(product.name)
+            return f"name::{normalize(query)}", query
+        return product.ean, product.ean
+
+    def _result_from_cached(
+        self, product: InputProduct, query: str, cached: Dict[str, Any]
+    ) -> ProductResult:
+        field_names = set(ProductResult.__dataclass_fields__.keys())
+        data = {k: v for k, v in cached.items() if k in field_names}
+        data["from_cache"] = True
+        data["name"] = product.name or data.get("name")
+        data["my_price"] = product.my_price
+        data["ean"] = product.ean
+        data["search_mode"] = self.search_mode
+        data["search_query"] = query
+        return ProductResult(**data)
+
+    def resolve_from_cache_bulk(
+        self, products: List[InputProduct]
+    ) -> Tuple[List[Tuple[int, ProductResult]], List[Tuple[int, InputProduct]]]:
+        """
+        Rozdziela listę na trafienia cache i braki.
+        Zwraca (hits z indeksem, misses z indeksem) — kolejność oryginalna zachowana w indeksach.
+        """
+        keyed: List[Tuple[int, InputProduct, str, Optional[str]]] = []
+        for i, product in enumerate(products):
+            cache_key, query = self._cache_key_and_query(product)
+            keyed.append((i, product, cache_key, query))
+
+        cached_map = self.cache.get_many_if_valid(
+            [k for _, _, k, q in keyed if q],
+            self.config.ttl_days,
+        )
+
+        hits: List[Tuple[int, ProductResult]] = []
+        misses: List[Tuple[int, InputProduct]] = []
+        for i, product, cache_key, query in keyed:
+            if not query:
+                result = ProductResult(
+                    ean=product.ean,
+                    my_price=product.my_price,
+                    name=product.name,
+                    checked_at=datetime.now().isoformat(),
+                    search_mode=self.search_mode,
+                    status="error",
+                    error_message="Brak nazwy produktu do wyszukania",
+                )
+                hits.append((i, result))
+                continue
+            cached = cached_map.get(cache_key)
+            if cached:
+                hits.append((i, self._result_from_cached(product, query, cached)))
+            else:
+                misses.append((i, product))
+        return hits, misses
+
+    def process_single(self, product: InputProduct, *, skip_cache: bool = False) -> ProductResult:
         """Przetwarza pojedynczy produkt."""
         result = ProductResult(
             ean=product.ean,
@@ -154,170 +222,244 @@ class ProductProcessor:
             checked_at=datetime.now().isoformat(),
             search_mode=self.search_mode,
         )
-        
-        if self.search_mode == "name":
-            query = build_search_query(product.name)
-            cache_key = f"name::{normalize(query)}"
-        else:
-            query = product.ean
-            cache_key = product.ean
+
+        cache_key, query = self._cache_key_and_query(product)
         result.search_query = query
-        
+
         if not query:
             result.status = "error"
             result.error_message = "Brak nazwy produktu do wyszukania"
             return result
-        
-        # Sprawdz cache
-        cached = self.cache.get_if_valid(cache_key, self.config.ttl_days)
-        if cached:
-            field_names = set(ProductResult.__dataclass_fields__.keys())
-            data = {k: v for k, v in cached.items() if k in field_names}
-            data["from_cache"] = True
-            # Nazwa i cena z biezacego wejscia (cache moze pochodzic ze starego formatu)
-            data["name"] = product.name or data.get("name")
-            data["my_price"] = product.my_price
-            data["ean"] = product.ean
-            data["search_mode"] = self.search_mode
-            data["search_query"] = query
-            return ProductResult(**data)
-        
+
+        if not skip_cache:
+            cached = self.cache.get_if_valid(cache_key, self.config.ttl_days)
+            if cached:
+                return self._result_from_cached(product, query, cached)
+
         if not self.data_fetcher:
             result.status = "error"
             result.error_message = "Brak skonfigurowanego fetchera danych"
             return result
-        
+
         try:
-            # Pobierz dane z Allegro
             offers_data = self.data_fetcher(query)
-            
+
             if not offers_data:
                 result.status = "checked"
                 result.found_on_allegro = False
                 self.cache.set(cache_key, result.to_dict())
                 return result
-            
+
             result.found_on_allegro = True
             result.offers = [AllegroOffer(**o) for o in offers_data]
-            
-            # Filtruj oferty spelniajace kryteria
+
             for offer in result.offers:
                 price_ok = self.check_price_match(product.my_price, offer.price)
                 sales_ok = self.check_sales(offer.buyers_count)
-                
                 if price_ok and sales_ok:
                     result.matching_offers.append(offer)
-            
-            # Wybierz najlepsza oferte (najwiecej kupujacych)
+
             if result.matching_offers:
                 result.best_match = max(
                     result.matching_offers,
-                    key=lambda o: o.buyers_count or 0
+                    key=lambda o: o.buyers_count or 0,
                 )
-            
+
             result.status = "checked"
             self.cache.set(cache_key, result.to_dict())
-            
+
         except Exception as e:
             result.status = "error"
             result.error_message = str(e)
-            # Bledow nie cache'ujemy — unikamy falszywego "nie znaleziono"
-        
+
         return result
-    
-    def process_batch(self, products: List[InputProduct],
-                      progress_callback: Optional[Callable] = None) -> List[ProductResult]:
-        """Przetwarza liste produktow."""
+
+    def process_batch(
+        self,
+        products: List[InputProduct],
+        progress_callback: Optional[Callable] = None,
+        max_workers: int = 1,
+    ) -> List[ProductResult]:
+        """Przetwarza liste produktow (opcjonalnie równolegle)."""
+        if max_workers and max_workers > 1:
+            return self.process_batch_parallel(
+                products,
+                max_workers=max_workers,
+                progress_callback=progress_callback,
+            )
+
         self._running = True
         self._paused = False
-        self._results = []
+        self._results = [None] * len(products)  # type: ignore
         self._progress_callback = progress_callback
-        
-        for i, product in enumerate(products):
+        done = 0
+
+        hits, misses = self.resolve_from_cache_bulk(products)
+        for i, result in hits:
             if not self._running:
                 break
-            
+            self._results[i] = result
+            done += 1
+            self._current_index = done
+            if progress_callback:
+                progress_callback(done, len(products), result)
+
+        for i, product in misses:
+            if not self._running:
+                break
+
             while self._paused:
                 time.sleep(0.5)
                 if not self._running:
                     break
-            
-            self._current_index = i
-            result = self.process_single(product)
-            self._results.append(result)
-            
+
+            result = self.process_single(product, skip_cache=True)
+            self._results[i] = result
+            done += 1
+            self._current_index = done
             if progress_callback:
-                progress_callback(i + 1, len(products), result)
-            
-            # Rate limiting
-            if i < len(products) - 1:
-                time.sleep(self.config.delay_seconds)
-        
+                progress_callback(done, len(products), result)
+
+            delay = float(self.config.delay_seconds or 0)
+            if delay > 0 and done < len(products):
+                time.sleep(delay)
+
         self._running = False
-        return self._results
-    
+        return [r for r in self._results if r is not None]
+
+    def process_batch_parallel(
+        self,
+        products: List[InputProduct],
+        max_workers: int = 5,
+        progress_callback: Optional[Callable] = None,
+    ) -> List[ProductResult]:
+        """
+        Przetwarza listę: najpierw bulk cache, potem braki w ThreadPool.
+        max_workers powinien być <= ConcurrentRequest z scrape.do.
+        """
+        workers = max(1, int(max_workers or 1))
+        self._running = True
+        self._paused = False
+        self._results = [None] * len(products)  # type: ignore
+        self._progress_callback = progress_callback
+        done = 0
+        done_lock = threading.Lock()
+
+        hits, misses = self.resolve_from_cache_bulk(products)
+        for i, result in hits:
+            self._results[i] = result
+            done += 1
+            self._current_index = done
+            if progress_callback:
+                progress_callback(done, len(products), result)
+
+        def _work(item: Tuple[int, InputProduct]) -> Tuple[int, ProductResult]:
+            idx, product = item
+            while self._paused and self._running:
+                time.sleep(0.2)
+            if not self._running:
+                return idx, ProductResult(
+                    ean=product.ean,
+                    my_price=product.my_price,
+                    name=product.name,
+                    checked_at=datetime.now().isoformat(),
+                    search_mode=self.search_mode,
+                    status="error",
+                    error_message="Zatrzymano",
+                )
+            return idx, self.process_single(product, skip_cache=True)
+
+        if misses and self._running:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {executor.submit(_work, item): item[0] for item in misses}
+                for future in as_completed(futures):
+                    if not self._running:
+                        for f in futures:
+                            f.cancel()
+                        break
+                    idx, result = future.result()
+                    self._results[idx] = result
+                    with done_lock:
+                        done += 1
+                        self._current_index = done
+                        current_done = done
+                    if progress_callback:
+                        progress_callback(current_done, len(products), result)
+
+        self._running = False
+        return [r for r in self._results if r is not None]
+
     def pause(self):
         self._paused = True
-    
+
     def resume(self):
         self._paused = False
-    
+
     def stop(self):
         self._running = False
-    
+
     @property
     def is_running(self) -> bool:
         return self._running
-    
+
     @property
     def is_paused(self) -> bool:
         return self._paused
-    
+
     @property
     def current_progress(self) -> tuple:
         return (self._current_index, len(self._results))
-    
+
     def save_results(self, path: str, results: Optional[List[ProductResult]] = None):
         """Zapisuje wyniki do pliku JSON."""
         results = results or self._results
         output_path = Path(path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         data = {
             "generated_at": datetime.now().isoformat(),
             "config": asdict(self.config),
             "total_products": len(results),
             "found_on_allegro": sum(1 for r in results if r.found_on_allegro),
             "with_matching_offers": sum(1 for r in results if r.matching_offers),
-            "products": [r.to_dict() for r in results]
+            "products": [r.to_dict() for r in results],
         }
-        
+
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-    
+
     def save_results_csv(self, path: str, results: Optional[List[ProductResult]] = None):
         """Zapisuje wyniki do CSV (uproszczone)."""
         results = results or self._results
         output_path = Path(path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         with open(output_path, "w", encoding="utf-8", newline="") as f:
             writer = csv.writer(f, delimiter=";")
-            writer.writerow([
-                "Kod", "Moja cena", "Nazwa", "Znaleziono", 
-                "Najlepsza oferta - cena", "Najlepsza oferta - kupilo osob",
-                "Najlepsza oferta - URL", "Status"
-            ])
-            
+            writer.writerow(
+                [
+                    "Kod",
+                    "Moja cena",
+                    "Nazwa",
+                    "Znaleziono",
+                    "Najlepsza oferta - cena",
+                    "Najlepsza oferta - kupilo osob",
+                    "Najlepsza oferta - URL",
+                    "Status",
+                ]
+            )
+
             for r in results:
                 best = r.best_match
-                writer.writerow([
-                    r.ean,
-                    r.my_price,
-                    r.name or "",
-                    "Tak" if r.found_on_allegro else "Nie",
-                    best.price if best else "",
-                    best.buyers_count if best else "",
-                    best.url if best else "",
-                    r.status
-                ])
+                writer.writerow(
+                    [
+                        r.ean,
+                        r.my_price,
+                        r.name or "",
+                        "Tak" if r.found_on_allegro else "Nie",
+                        best.price if best else "",
+                        best.buyers_count if best else "",
+                        best.url if best else "",
+                        r.status,
+                    ]
+                )

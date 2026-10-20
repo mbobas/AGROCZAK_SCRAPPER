@@ -16,43 +16,50 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.core.processor import ProductProcessor, ProcessorConfig, ProductResult
 from src.core.cache import ProductCache
+from src.api.scraper import ALLEGRO_CREDITS_RENDER_OFF, ALLEGRO_CREDITS_RENDER_ON
 
 console = Console()
 
 
 def create_data_fetcher(render: bool = False):
-    """Tworzy funkcje do pobierania danych przez scrape.do."""
+    """Tworzy funkcje do pobierania danych przez scrape.do. Zwraca (fetcher, client)."""
     try:
         from src.api.scraper import create_scrape_fetcher, ScrapeDoClient
         import warnings
-        warnings.filterwarnings('ignore', category=Warning)
+
+        warnings.filterwarnings("ignore", category=Warning)
 
         client = ScrapeDoClient()
         info = client.get_credits_info()
-        remaining = info.get('RemainingMonthlyRequest', 0)
+        remaining = info.get("RemainingMonthlyRequest", 0)
+        cost = ALLEGRO_CREDITS_RENDER_ON if render else ALLEGRO_CREDITS_RENDER_OFF
         console.print(f"[dim]scrape.do: {remaining} kredytow pozostalo[/dim]")
         console.print(
-            f"[dim]render={'ON (~5 kred.)' if render else 'OFF (~1 kred.)'}[/dim]"
+            f"[dim]render={'ON' if render else 'OFF'} (~{cost} kred./kod Allegro)[/dim]"
         )
 
-        if remaining < 10:
+        if remaining is not None and remaining < cost:
             console.print("[red]Za malo kredytow scrape.do![/red]")
-            return None
+            return None, client
 
-        return create_scrape_fetcher(render=render)
+        return create_scrape_fetcher(render=render), client
 
     except Exception as e:
         console.print(f"[yellow]scrape.do niedostepne: {e}[/yellow]")
-        return None
+        return None, None
 
 
 def progress_callback(current: int, total: int, result: ProductResult):
     """Callback dla postępu - wyswietla informacje o biezacym produkcie."""
     status_icon = "✓" if result.found_on_allegro else "✗"
+    cache_tag = " [cache]" if result.from_cache else ""
     match_info = ""
     if result.best_match:
-        match_info = f" | Najlepsza: {result.best_match.price} PLN ({result.best_match.buyers_count} kupilo)"
-    console.print(f"  [{current}/{total}] {status_icon} {result.ean}{match_info}")
+        match_info = (
+            f" | Najlepsza: {result.best_match.price} PLN "
+            f"({result.best_match.buyers_count} kupilo)"
+        )
+    console.print(f"  [{current}/{total}] {status_icon} {result.ean}{cache_tag}{match_info}")
 
 
 def run_console_mode(args):
@@ -60,21 +67,29 @@ def run_console_mode(args):
     console.print(Panel("Allegro Price Monitor - Tryb konsolowy (scrape.do)", style="bold blue"))
 
     config = ProcessorConfig.from_yaml(args.config)
-    console.print(f"[dim]Konfiguracja: markup {config.min_markup*100:.0f}-{config.max_markup*100:.0f}%, "
-                  f"min kupujacych: {config.min_buyers}, TTL: {config.ttl_days} dni[/dim]")
+    console.print(
+        f"[dim]Konfiguracja: markup {config.min_markup*100:.0f}-{config.max_markup*100:.0f}%, "
+        f"min kupujacych: {config.min_buyers}, TTL: {config.ttl_days} dni[/dim]"
+    )
 
     render = bool(getattr(args, "render", False))
     if not render:
         console.print(
-            "[yellow]Uwaga: render JS wylaczony (uzyj --render dla pelniejszego listingu) — taniej (~1 kred.), ale Allegro moze zwrocic "
-            "mniej ofert albo bez liczby kupujacych; czasem 0 wynikow.[/yellow]"
+            f"[yellow]Uwaga: render JS wylaczony (uzyj --render dla pelniejszego listingu) — "
+            f"taniej (~{ALLEGRO_CREDITS_RENDER_OFF} kred./kod Allegro). "
+            f"Render ON ≈ {ALLEGRO_CREDITS_RENDER_ON} kred.[/yellow]"
         )
 
-    fetcher = create_data_fetcher(render=render)
+    fetcher, client = create_data_fetcher(render=render)
     if not fetcher:
         console.print("[red]Nie mozna utworzyc polaczenia ze scrape.do![/red]")
         console.print("[yellow]Sprawdz SCRAPE_DO_TOKEN w pliku .env[/yellow]")
         return
+
+    workers = int(getattr(args, "workers", 0) or 0)
+    if workers <= 0:
+        workers = client.get_concurrency_limit(fallback=5) if client else 5
+    console.print(f"[dim]Rownolegle workerów: {workers} (limit Concurrent scrape.do)[/dim]")
 
     processor = ProductProcessor(config=config, data_fetcher=fetcher)
 
@@ -89,8 +104,12 @@ def run_console_mode(args):
         console.print("[yellow]Brak produktow do sprawdzenia[/yellow]")
         return
 
-    console.print("\n[bold]Rozpoczynam sprawdzanie...[/bold]")
-    results = processor.process_batch(products, progress_callback=progress_callback)
+    console.print("\n[bold]Rozpoczynam sprawdzanie (cache bulk + parallel)...[/bold]")
+    results = processor.process_batch(
+        products,
+        progress_callback=progress_callback,
+        max_workers=workers,
+    )
 
     output_path = args.output
     if not output_path:
@@ -110,6 +129,7 @@ def run_console_mode(args):
     table.add_row("Sprawdzonych produktow", str(len(results)))
     table.add_row("Znalezionych na Allegro", str(sum(1 for r in results if r.found_on_allegro)))
     table.add_row("Z pasujacymi ofertami", str(sum(1 for r in results if r.matching_offers)))
+    table.add_row("Z cache", str(sum(1 for r in results if r.from_cache)))
     table.add_row("Bledow", str(sum(1 for r in results if r.status == "error")))
 
     console.print(table)
@@ -121,6 +141,7 @@ def run_test_mode():
 
     console.print("\n[bold]Test scrape.do[/bold]")
     from src.api.scraper import test_scrape_do
+
     scrape_ok = test_scrape_do()
 
     console.print("\n[bold]Podsumowanie:[/bold]")
@@ -150,15 +171,27 @@ def main():
     run_parser.add_argument(
         "--render",
         action="store_true",
-        help="Wlacz headless JS (~5 kred./kod zamiast ~1). Pelniejszy listing.",
+        help=(
+            f"Wlacz headless JS (~{ALLEGRO_CREDITS_RENDER_ON} kred./kod zamiast "
+            f"~{ALLEGRO_CREDITS_RENDER_OFF}). Pelniejszy listing."
+        ),
+    )
+    run_parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="Liczba rownoleglych workerow (0 = auto z Concurrent scrape.do)",
     )
 
     subparsers.add_parser("test", help="Testuj polaczenie ze scrape.do")
     subparsers.add_parser("gui", help="Uruchom interfejs graficzny")
 
     cache_parser = subparsers.add_parser("cache", help="Zarzadzanie cache")
-    cache_parser.add_argument("action", choices=["stats", "clear", "clear-expired"],
-                             help="Akcja: stats, clear, clear-expired")
+    cache_parser.add_argument(
+        "action",
+        choices=["stats", "clear", "clear-expired"],
+        help="Akcja: stats, clear, clear-expired",
+    )
 
     args = parser.parse_args()
 

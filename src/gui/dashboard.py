@@ -9,6 +9,7 @@ from datetime import datetime
 import json
 import time
 import threading
+import queue
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -24,7 +25,12 @@ from dotenv import load_dotenv
 
 from src.core.processor import ProductProcessor, ProcessorConfig, InputProduct, ProductResult
 from src.core.cache import ProductCache
-from src.api.scraper import ScrapeDoClient, search_allegro_by_ean
+from src.api.scraper import (
+    ScrapeDoClient,
+    search_allegro_by_ean,
+    ALLEGRO_CREDITS_RENDER_OFF,
+    ALLEGRO_CREDITS_RENDER_ON,
+)
 
 load_dotenv()
 
@@ -255,6 +261,12 @@ def init_session_state():
         st.session_state.analyze_products = []
     if "analyze_source_label" not in st.session_state:
         st.session_state.analyze_source_label = None
+    if "job_result_queue" not in st.session_state:
+        st.session_state.job_result_queue = None
+    if "job_finished" not in st.session_state:
+        st.session_state.job_finished = True
+    if "job_workers" not in st.session_state:
+        st.session_state.job_workers = 10
 
 
 def _row_value(row: pd.Series, *keys: str) -> str:
@@ -428,18 +440,22 @@ def sidebar_config():
     
     st.sidebar.subheader("Rate limiting")
     delay = st.sidebar.number_input(
-        "Opóźnienie (s)", 1, 60, int(config.delay_seconds)
+        "Opóźnienie (s)",
+        0,
+        60,
+        int(config.delay_seconds or 0),
+        help="Przy scrapie równoległym zwykle 0. Cache i tak bez opóźnienia.",
     )
-    
+
     # Aktualizuj config
     st.session_state.config = ProcessorConfig(
         min_markup=min_markup,
         max_markup=max_markup,
         min_buyers=min_buyers,
         ttl_days=ttl_days,
-        delay_seconds=float(delay)
+        delay_seconds=float(delay),
     )
-    
+
     st.sidebar.subheader("Źródło danych")
     st.sidebar.caption("Zablokowane: **scrape.do** (listing Allegro jak w przeglądarce).")
     st.session_state.data_source = "scrape_do"
@@ -447,14 +463,19 @@ def sidebar_config():
     st.sidebar.toggle(
         "Render JS (headless)",
         key="use_render",
-        help="OFF (domyślnie) ≈ 1 kred./zapytanie. ON ≈ 5 kred./zapytanie (pełniejszy listing).",
+        help=(
+            f"OFF (domyślnie) ≈ {ALLEGRO_CREDITS_RENDER_OFF} kred./zapytanie Allegro. "
+            f"ON ≈ {ALLEGRO_CREDITS_RENDER_ON} kred. (residential + headless)."
+        ),
     )
     if st.session_state.use_render:
-        st.sidebar.caption("~5 kred./zapytanie — pełniejszy listing.")
+        st.sidebar.caption(
+            f"~{ALLEGRO_CREDITS_RENDER_ON} kred./zapytanie — pełniejszy listing."
+        )
     else:
-        st.sidebar.warning(
-            "Bez renderu taniej (~1 kred.), ale Allegro może zwrócić mniej ofert "
-            "albo bez liczby kupujących; czasem 0 wyników mimo że na stronie coś jest."
+        st.sidebar.caption(
+            f"Bez renderu taniej (~{ALLEGRO_CREDITS_RENDER_OFF} kred. Allegro). "
+            "Mniej ofert / bez liczby kupujących możliwe."
         )
 
     # Cache stats
@@ -513,18 +534,27 @@ def sidebar_config():
             st.sidebar.progress(min(usage_pct / 100, 1.0))
             st.sidebar.caption(f"Zużycie: {usage_pct:.1f}% ({used:,} / {max_credits:,})")
             
-            # Limit równoczesnych
-            concurrent = info.get('RemainingConcurrentRequest', 0)
-            st.sidebar.caption(f"Równoczesne zapytania: {concurrent}")
-            
-            # Koszty — aktywny tryb
+            # Limit równoczesnych (plan Hobby = 10)
+            concurrent_limit = info.get("ConcurrentRequest") or client.stats.concurrent_limit
+            concurrent_free = info.get("RemainingConcurrentRequest", 0)
+            st.sidebar.caption(
+                f"Concurrent: **{concurrent_limit}** "
+                f"(wolne sloty teraz: {concurrent_free})"
+            )
+
+            # Koszty — aktywny tryb (Allegro ≈ residential)
             active = st.session_state.get("use_render", False)
             if active:
-                st.sidebar.caption("**Aktywny tryb:** render ON → ~5 kred./zapytanie")
+                st.sidebar.caption(
+                    f"**Aktywny tryb:** render ON → ~{ALLEGRO_CREDITS_RENDER_ON} kred./zapytanie"
+                )
             else:
-                st.sidebar.caption("**Aktywny tryb:** render OFF → ~1 kred./zapytanie")
+                st.sidebar.caption(
+                    f"**Aktywny tryb:** render OFF → ~{ALLEGRO_CREDITS_RENDER_OFF} kred./zapytanie"
+                )
             st.sidebar.caption(
-                "Cennik: render=true = 5 kred. · render=false = 1 kred."
+                f"Allegro: OFF≈{ALLEGRO_CREDITS_RENDER_OFF} · ON≈{ALLEGRO_CREDITS_RENDER_ON} "
+                "(jak super/residential; header Scrape.do-Request-Cost jest wiążący)"
             )
         else:
             st.sidebar.warning("Nie można pobrać info o kredytach")
@@ -636,6 +666,9 @@ def range_section(df: pd.DataFrame) -> pd.DataFrame:
             max_monthly = info.get("MaxMonthlyRequest")
             if max_monthly is not None:
                 client.stats.max_monthly_credits = max_monthly
+            concurrent = info.get("ConcurrentRequest")
+            if concurrent is not None:
+                client.stats.concurrent_limit = concurrent
         use_render = bool(st.session_state.get("use_render", False))
         estimate = client.estimate_cost(1, render=use_render)
         can_process = estimate.get("can_process")
@@ -724,10 +757,14 @@ def cost_estimate_section(num_products: int):
 
     use_render = bool(st.session_state.get("use_render", False))
     estimate = client.estimate_cost(num_products, render=use_render)
-    cost_per = estimate.get("cost_per_request", 5 if use_render else 1)
+    cost_per = estimate.get(
+        "cost_per_request",
+        ALLEGRO_CREDITS_RENDER_ON if use_render else ALLEGRO_CREDITS_RENDER_OFF,
+    )
+    workers = client.get_concurrency_limit(fallback=5)
     st.caption(
         f"Tryb: render={'ON' if use_render else 'OFF'} "
-        f"(~{cost_per} kred./produkt)"
+        f"(~{cost_per} kred./produkt Allegro) · równolegle do **{workers}** zapytań"
     )
 
     col1, col2, col3 = st.columns(3)
@@ -1208,57 +1245,98 @@ def _stop_job() -> None:
     st.session_state.current_ean = None
     st.session_state.job_products = []
     st.session_state.job_index = 0
+    st.session_state.job_finished = True
     processor = st.session_state.processor
     if processor is not None:
         processor.stop()
 
 
+def _start_background_job(products: list[InputProduct], max_workers: int) -> None:
+    """Uruchamia cache bulk + równoległy scrape w wątku tła."""
+    processor: ProductProcessor = st.session_state.processor
+    processor.config = st.session_state.config
+    result_q: queue.Queue = queue.Queue()
+    st.session_state.job_result_queue = result_q
+    st.session_state.job_finished = False
+    st.session_state.job_workers = max_workers
+
+    def _on_progress(current: int, total: int, result: ProductResult) -> None:
+        result_q.put(
+            {
+                "type": "result",
+                "current": current,
+                "total": total,
+                "ean": result.ean,
+                "result": result.to_dict(),
+            }
+        )
+
+    def _run() -> None:
+        try:
+            processor.process_batch(
+                products,
+                progress_callback=_on_progress,
+                max_workers=max_workers,
+            )
+        except Exception as exc:
+            result_q.put({"type": "error", "message": str(exc)})
+        finally:
+            result_q.put({"type": "done"})
+
+    thread = threading.Thread(target=_run, name="scrape-job", daemon=True)
+    st.session_state.job_thread = thread
+    thread.start()
+
+
 def process_job_tick() -> None:
     """
-    Przetwarza jeden produkt z kolejki (jeden krok na rerun).
-    Wywoływać po sekcji postępu, gdy running and not paused.
+    Odbiera wyniki z wątku tła (cache + parallel) i odświeża UI.
     """
-    if not st.session_state.running or st.session_state.paused:
+    if not st.session_state.running:
         return
 
-    products: list[InputProduct] = st.session_state.job_products
-    idx = st.session_state.job_index
-    processor: ProductProcessor | None = st.session_state.processor
-
-    if not products or processor is None:
-        _stop_job()
-        st.error("Brak kolejki produktów lub procesora — zatrzymano.")
+    result_q = st.session_state.get("job_result_queue")
+    if result_q is None:
         return
 
-    if idx >= len(products):
+    drained = 0
+    finished = False
+    err_msg = None
+    while True:
+        try:
+            item = result_q.get_nowait()
+        except queue.Empty:
+            break
+        drained += 1
+        kind = item.get("type")
+        if kind == "result":
+            st.session_state.results.append(item["result"])
+            st.session_state.progress = item["current"]
+            st.session_state.job_index = item["current"]
+            st.session_state.current_ean = item.get("ean")
+        elif kind == "error":
+            err_msg = item.get("message") or "Błąd joba"
+        elif kind == "done":
+            finished = True
+
+    if err_msg:
+        st.error(f"Błąd scrapowania: {err_msg}")
+
+    if finished:
         st.session_state.running = False
         st.session_state.paused = False
         st.session_state.current_ean = None
-        refresh_credits_info()
-        _autosave_and_notify()
-        return
-
-    product = products[idx]
-    st.session_state.current_ean = product.ean
-    st.caption(f"Pobieranie danych dla `{product.ean}`…")
-
-    processor.config = st.session_state.config
-    result = processor.process_single(product)
-    st.session_state.results.append(result.to_dict())
-    st.session_state.job_index = idx + 1
-    st.session_state.progress = idx + 1
-
-    if st.session_state.job_index >= len(products):
-        st.session_state.running = False
-        st.session_state.paused = False
-        st.session_state.current_ean = None
+        st.session_state.job_finished = True
         refresh_credits_info()
         _autosave_and_notify()
         st.rerun()
         return
 
-    delay = float(st.session_state.config.delay_seconds)
-    time.sleep(delay)
+    if st.session_state.paused:
+        return
+
+    # Krótki poll — bez sleep(6) między produktami
+    time.sleep(0.25 if drained else 0.4)
     st.rerun()
 
 
@@ -1325,12 +1403,24 @@ def scrape_tab() -> None:
                 st.session_state.selected_df = selected_df
                 st.session_state.last_autosave_path = None
                 refresh_credits_info()
+                client = get_scrape_client()
+                workers = (
+                    client.get_concurrency_limit(fallback=10) if client else 10
+                )
+                _start_background_job(products, max_workers=workers)
                 render_label = "on" if st.session_state.get("use_render", False) else "off"
+                cost = (
+                    ALLEGRO_CREDITS_RENDER_ON
+                    if st.session_state.get("use_render")
+                    else ALLEGRO_CREDITS_RENDER_OFF
+                )
                 st.info(
                     f"Przetwarzanie wierszy "
                     f"{st.session_state.range_start}–{st.session_state.range_end} "
-                    f"({len(products)} produktów, źródło: scrape.do, render={render_label})."
+                    f"({len(products)} produktów, scrape.do, render={render_label}, "
+                    f"~{cost} kred./kod, **{workers}** równolegle)."
                 )
+                st.rerun()
     elif start_btn and selected_df is None:
         st.error("Najpierw wczytaj plik CSV.")
     elif start_btn and not can_start:
