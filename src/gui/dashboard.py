@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 from dotenv import load_dotenv
 
@@ -38,6 +39,8 @@ AUTH_WEBHOOK_URL = (
     "https://marcin286-20286.wykr.es/webhook/68fe834b-69fc-4ee4-8170-f443b66caa1e"
 )
 AUTH_REQUEST_TIMEOUT_S = 15
+AUTH_STORAGE_KEY = "agroczak_authenticated"
+AUTH_QUERY_KEY = "auth"
 
 
 def _request_host() -> str:
@@ -98,16 +101,98 @@ def verify_password(password: str) -> tuple[bool, str]:
     return False, "Nieprawidłowe hasło."
 
 
+def _write_auth_to_browser(remember: bool) -> None:
+    """Zapisuje / czyści flagę logowania w localStorage przeglądarki."""
+    js_value = "1" if remember else ""
+    components.html(
+        f"""
+        <script>
+        (function () {{
+          const key = {AUTH_STORAGE_KEY!r};
+          const value = {js_value!r};
+          try {{
+            if (value) {{
+              window.parent.localStorage.setItem(key, value);
+            }} else {{
+              window.parent.localStorage.removeItem(key);
+            }}
+          }} catch (e) {{}}
+        }})();
+        </script>
+        """,
+        height=0,
+    )
+
+
+def _sync_auth_from_browser() -> None:
+    """
+    Odtwarza logowanie z localStorage / query param.
+    localStorage nie jest widoczne w Pythonie — JS ustawia ?auth=1 i przeładowuje raz.
+    """
+    if st.session_state.get("authenticated"):
+        return
+
+    if st.query_params.get(AUTH_QUERY_KEY) == "1":
+        st.session_state.authenticated = True
+        return
+
+    components.html(
+        f"""
+        <script>
+        (function () {{
+          const key = {AUTH_STORAGE_KEY!r};
+          const q = {AUTH_QUERY_KEY!r};
+          try {{
+            const saved = window.parent.localStorage.getItem(key);
+            const url = new URL(window.parent.location.href);
+            if (saved === "1" && url.searchParams.get(q) !== "1") {{
+              url.searchParams.set(q, "1");
+              window.parent.location.replace(url.toString());
+            }}
+          }} catch (e) {{}}
+        }})();
+        </script>
+        """,
+        height=0,
+    )
+
+
+def _mark_authenticated() -> None:
+    """Ustawia sesję + query; localStorage zapisze się w kolejnym rerunie."""
+    st.session_state.authenticated = True
+    st.session_state._auth_persist = True
+    st.query_params[AUTH_QUERY_KEY] = "1"
+
+
+def logout() -> None:
+    """Czyści sesję, query param i localStorage."""
+    st.session_state.authenticated = False
+    st.session_state._auth_persist = False
+    if AUTH_QUERY_KEY in st.query_params:
+        del st.query_params[AUTH_QUERY_KEY]
+    st.rerun()
+
+
 def require_login() -> bool:
     """
     Bramka wejścia: pokazuje formularz hasła, dopóki sesja nie jest uwierzytelniona.
     Zwraca True gdy użytkownik może korzystać z aplikacji.
     """
+    # localStorage aktualizujemy w osobnym przebiegu (po rerun), żeby JS na pewno się wykonał
+    just_logged_out = False
+    if "_auth_persist" in st.session_state:
+        remember = bool(st.session_state.pop("_auth_persist"))
+        _write_auth_to_browser(remember)
+        just_logged_out = not remember
+
+    # Po wylogowaniu nie odtwarzaj sesji ze starego localStorage w tym samym przebiegu
+    if not just_logged_out:
+        _sync_auth_from_browser()
     if st.session_state.get("authenticated"):
         return True
 
     st.title("Allegro Price Monitor")
-    st.caption("Aby wejść, podaj hasło dostępu.")
+    st.caption("Aby wejść, podaj hasło dostępu. Po zalogowaniu dostęp zapamiętamy w tej przeglądarce.")
 
     with st.form("login_form", clear_on_submit=False):
         password = st.text_input("Hasło", type="password", autocomplete="current-password")
@@ -116,7 +201,7 @@ def require_login() -> bool:
     if submitted:
         ok, message = verify_password(password)
         if ok:
-            st.session_state.authenticated = True
+            _mark_authenticated()
             st.rerun()
         st.error(message or "Nieprawidłowe hasło.")
 
@@ -1291,8 +1376,7 @@ def main():
             "Wersja 1.3 · tryb: analyze-only"
         )
         if st.sidebar.button("Wyloguj"):
-            st.session_state.authenticated = False
-            st.rerun()
+            logout()
         return
 
     st.title("Allegro Price Monitor")
@@ -1318,8 +1402,7 @@ def main():
 
     st.sidebar.divider()
     if st.sidebar.button("Wyloguj"):
-        st.session_state.authenticated = False
-        st.rerun()
+        logout()
     st.sidebar.caption("""
     **Allegro Price Monitor**  
     Wersja 1.3 · źródło: scrape.do
