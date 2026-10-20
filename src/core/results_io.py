@@ -207,18 +207,88 @@ def summary_row(
 
 
 
-def flatten_offers(
-    products: List[Dict[str, Any]], *, min_match_pct: float = 0.0
+def filter_offers(
+    product: Dict[str, Any],
+    *,
+    markup_min_pct: Optional[float] = None,
+    markup_max_pct: Optional[float] = None,
+    min_buyers: Optional[int] = None,
+    min_match_pct: float = 0.0,
 ) -> List[Dict[str, Any]]:
-    """Spłaszcza produkty × oferty (po dedupie); oferty poniżej progu dopasowania pomijane."""
+    """
+    Oferty produktu (po dedupie) spełniające filtry — jedno źródło prawdy.
+    markup_*_pct None = brak ograniczenia (nieskończoność); bez żadnej granicy
+    przechodzą też oferty bez ceny/mojej ceny.
+    min_buyers None/0 = bez filtra (None w buyers_count przechodzi);
+    >= 1 = oferta musi mieć buyers_count >= min_buyers.
+    """
+    my_price = float(product.get("my_price") or 0)
+    check_markup = markup_min_pct is not None or markup_max_pct is not None
+    out: List[Dict[str, Any]] = []
+    for offer in dedupe_offers(product.get("offers") or []):
+        try:
+            price = float(offer.get("price") or 0)
+        except (TypeError, ValueError):
+            price = 0.0
+        if check_markup:
+            if price <= 0 or my_price <= 0:
+                continue
+            markup = round((price / my_price - 1) * 100, 6)  # szum float
+            if markup_min_pct is not None and markup < markup_min_pct:
+                continue
+            if markup_max_pct is not None and markup > markup_max_pct:
+                continue
+        if min_buyers is not None and min_buyers > 0:
+            buyers = offer.get("buyers_count")
+            if buyers is None or int(buyers) < min_buyers:
+                continue
+        if not _match_ok(product, offer, min_match_pct):
+            continue
+        out.append(offer)
+    return out
+
+
+def analyzer_summary_row(
+    product: Dict[str, Any],
+    *,
+    markup_min_pct: Optional[float] = None,
+    markup_max_pct: Optional[float] = None,
+    min_buyers: Optional[int] = None,
+    min_match_pct: float = 0.0,
+) -> Dict[str, Any]:
+    """Wiersz podsumowania liczony wyłącznie z przefiltrowanych ofert."""
+    offers = filter_offers(
+        product,
+        markup_min_pct=markup_min_pct,
+        markup_max_pct=markup_max_pct,
+        min_buyers=min_buyers,
+        min_match_pct=min_match_pct,
+    )
+    clone = dict(product)
+    clone["offers"] = offers
+    clone["matching_offers"] = offers
+    return summary_row(clone)
+
+
+def flatten_offers(
+    products: List[Dict[str, Any]],
+    *,
+    min_match_pct: float = 0.0,
+    markup_min_pct: Optional[float] = None,
+    markup_max_pct: Optional[float] = None,
+    min_buyers: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Spłaszcza produkty × oferty (po dedupie) — tylko oferty spełniające filtry."""
     rows: List[Dict[str, Any]] = []
     for product in products:
         my_price = float(product.get("my_price") or 0)
-        product_offers = [
-            o
-            for o in dedupe_offers(product.get("offers") or [])
-            if _match_ok(product, o, min_match_pct)
-        ]
+        product_offers = filter_offers(
+            product,
+            markup_min_pct=markup_min_pct,
+            markup_max_pct=markup_max_pct,
+            min_buyers=min_buyers,
+            min_match_pct=min_match_pct,
+        )
         product_offers.sort(
             key=lambda o: -(offer_match_pct(product, o) or 0.0)
         )
@@ -307,71 +377,28 @@ def load_results_json(path: Path) -> List[Dict[str, Any]]:
 def filter_products(
     products: List[Dict[str, Any]],
     *,
-    markup_min_pct: float = 0.0,
-    markup_max_pct: float = 50.0,
+    markup_min_pct: Optional[float] = 0.0,
+    markup_max_pct: Optional[float] = 50.0,
     min_offers: int = 0,
     require_offers: bool = True,
     min_buyers: Optional[int] = None,
-    require_buyers: bool = False,
-    match_mode: str = "any_in_range",
     min_match_pct: float = 0.0,
 ) -> List[Dict[str, Any]]:
     """
-    Lokalne filtrowanie produktów.
-    match_mode:
-      - any_in_range: którakolwiek oferta w zakresie marży
-      - cheapest_in_range: najtańsza oferta w zakresie marży
+    Lokalne filtrowanie produktów po ofertach spełniających filtry (filter_offers).
+    Produkt zostaje, gdy liczba przefiltrowanych ofert >= max(min_offers, 1 gdy require_offers).
+    markup_*_pct None = brak granicy (nieskończoność).
     """
+    needed = max(int(min_offers), 1 if require_offers else 0)
     filtered: List[Dict[str, Any]] = []
     for product in products:
-        stats = offer_stats(product)
-        offers = stats["offers"]
-
-        if require_offers and stats["offers_count"] == 0:
-            continue
-        if stats["offers_count"] < min_offers:
-            continue
-
-        my_price = float(product.get("my_price") or 0)
-
-        def offer_ok(offer: Dict[str, Any]) -> bool:
-            try:
-                price = float(offer.get("price") or 0)
-            except (TypeError, ValueError):
-                return False
-            if price <= 0 or my_price <= 0:
-                return False
-            markup = (price / my_price - 1) * 100
-            if markup < markup_min_pct or markup > markup_max_pct:
-                return False
-            if not _match_ok(product, offer, min_match_pct):
-                return False
-            if require_buyers:
-                buyers = offer.get("buyers_count")
-                if buyers is None:
-                    return False
-                if min_buyers is not None and int(buyers) < min_buyers:
-                    return False
-            elif min_buyers is not None and min_buyers > 0:
-                buyers = offer.get("buyers_count")
-                if buyers is not None and int(buyers) < min_buyers:
-                    return False
-            return True
-
-        if not offers:
-            if not require_offers:
-                filtered.append(product)
-            continue
-
-        if match_mode == "cheapest_in_range":
-            priced = [o for o in offers if float(o.get("price") or 0) > 0]
-            if not priced:
-                continue
-            cheapest = min(priced, key=lambda o: float(o.get("price") or 0))
-            if offer_ok(cheapest):
-                filtered.append(product)
-        else:
-            if any(offer_ok(o) for o in offers):
-                filtered.append(product)
-
+        offers = filter_offers(
+            product,
+            markup_min_pct=markup_min_pct,
+            markup_max_pct=markup_max_pct,
+            min_buyers=min_buyers,
+            min_match_pct=min_match_pct,
+        )
+        if len(offers) >= needed:
+            filtered.append(product)
     return filtered

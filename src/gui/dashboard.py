@@ -794,12 +794,12 @@ def results_section():
 def analyze_section():
     """Zakładka: wczytaj JSON wyników i filtruj lokalnie (bez kredytów)."""
     from src.core.results_io import (
+        analyzer_summary_row,
         filter_products,
         flatten_offers,
         list_result_files,
         load_results_json,
         save_results_json,
-        summary_row,
     )
 
     st.header("Analiza wyników")
@@ -858,12 +858,15 @@ def analyze_section():
     st.subheader("Filtry lokalne")
     c1, c2 = st.columns(2)
     with c1:
-        markup_range = st.slider(
+        markup_range = st.select_slider(
             "Zakres marży % (względem mojej ceny)",
-            min_value=0,
-            max_value=100,
+            options=list(range(-110, 111)),
             value=(0, 50),
+            format_func=lambda v: (
+                "-∞" if v <= -110 else "+∞" if v >= 110 else f"{v}%"
+            ),
             key="analyze_markup_range",
+            help="Skrajne położenia (-∞ / +∞) oznaczają brak ograniczenia z danej strony.",
         )
         min_offers = st.number_input(
             "Min. liczba ofert",
@@ -878,28 +881,16 @@ def analyze_section():
             value=True,
             key="analyze_require_offers",
         )
-        require_buyers = st.checkbox(
-            "Wymagaj liczby kupujących",
-            value=False,
-            key="analyze_require_buyers",
-            help="Gdy wyłączone, oferty bez buyers_count też przechodzą.",
-        )
         min_buyers = st.number_input(
-            "Min. kupujących (gdy wymagane / gdy podane)",
+            "Min. kupujących",
             min_value=0,
             max_value=1000,
             value=0,
             key="analyze_min_buyers",
-        )
-        match_mode = st.selectbox(
-            "Kryterium marży",
-            options=["any_in_range", "cheapest_in_range"],
-            format_func=lambda x: (
-                "Którakolwiek oferta w zakresie"
-                if x == "any_in_range"
-                else "Najtańsza oferta w zakresie"
+            help=(
+                "0 = bez filtra (oferty bez danych o kupujących też są widoczne). "
+                "Od 1 w górę ukrywa oferty poniżej progu oraz oferty bez danych."
             ),
-            key="analyze_match_mode",
         )
 
     has_names = any((p.get("name") or "").strip() for p in products)
@@ -921,16 +912,21 @@ def analyze_section():
     if not has_names:
         min_match = 0
 
+    m_lo = None if markup_range[0] <= -110 else float(markup_range[0])
+    m_hi = None if markup_range[1] >= 110 else float(markup_range[1])
+    buyers_f = int(min_buyers) if min_buyers > 0 else None
+    offer_filters = dict(
+        markup_min_pct=m_lo,
+        markup_max_pct=m_hi,
+        min_buyers=buyers_f,
+        min_match_pct=float(min_match),
+    )
+
     filtered = filter_products(
         products,
-        min_match_pct=float(min_match),
-        markup_min_pct=float(markup_range[0]),
-        markup_max_pct=float(markup_range[1]),
         min_offers=int(min_offers),
         require_offers=require_offers,
-        min_buyers=int(min_buyers) if min_buyers > 0 else None,
-        require_buyers=require_buyers,
-        match_mode=match_mode,
+        **offer_filters,
     )
 
     st.metric("Po filtrach", f"{len(filtered)} / {len(products)}")
@@ -943,19 +939,13 @@ def analyze_section():
 
     summary_df = pd.DataFrame(
         [
-            summary_row(
-                p,
-                min_markup=float(markup_range[0]) / 100.0,
-                max_markup=float(markup_range[1]) / 100.0,
-                min_buyers=int(min_buyers),
-                min_match_pct=float(min_match),
-            )
+            analyzer_summary_row(p, **offer_filters)
             for p in filtered
         ]
     )
     st.dataframe(summary_df, width="stretch")
 
-    flat = flatten_offers(filtered, min_match_pct=float(min_match))
+    flat = flatten_offers(filtered, **offer_filters)
     with st.expander(f"Oferty spłaszczone ({len(flat)})", expanded=True):
         if flat:
             st.dataframe(pd.DataFrame(flat), width="stretch")
