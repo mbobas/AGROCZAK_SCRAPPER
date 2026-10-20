@@ -122,7 +122,7 @@ class ScrapeDoClient:
         if len(self.stats.requests_history) > 100:
             self.stats.requests_history = self.stats.requests_history[-100:]
     
-    def scrape(self, url: str, render: bool = True) -> str:
+    def scrape(self, url: str, render: bool = False) -> str:
         """
         Scrapuje strone przez scrape.do.
         
@@ -192,7 +192,7 @@ class ScrapeDoClient:
             "last_updated": self.stats.last_updated,
         }
     
-    def estimate_cost(self, num_products: int, render: bool = True) -> dict:
+    def estimate_cost(self, num_products: int, render: bool = False) -> dict:
         """
         Szacuje koszt sprawdzenia podanej liczby produktów.
         
@@ -493,7 +493,7 @@ def parse_allegro_offer_html(html: str) -> Optional[OfferData]:
     return None
 
 
-def search_allegro_by_ean(ean: str, scraper: ScrapeDoClient, render: bool = True) -> List[OfferData]:
+def search_allegro_by_ean(ean: str, scraper: ScrapeDoClient, render: bool = False) -> List[OfferData]:
     """
     Wyszukuje produkty na Allegro po kodzie EAN / kodzie producenta.
     Zwraca liste ofert z informacjami o sprzedazy.
@@ -549,7 +549,12 @@ def search_allegro_by_ean(ean: str, scraper: ScrapeDoClient, render: bool = True
         )
 
 
-def create_scrape_fetcher(render: bool = True) -> callable:
+def search_allegro(query: str, scraper: ScrapeDoClient, render: bool = False) -> List[OfferData]:
+    """Wyszukuje oferty na Allegro po dowolnej frazie (kod lub nazwa)."""
+    return search_allegro_by_ean(query, scraper, render=render)
+
+
+def create_scrape_fetcher(render: bool = False) -> callable:
     """
     Tworzy funkcje do pobierania danych przez scrape.do.
     Uzywana jako data_fetcher w ProductProcessor.

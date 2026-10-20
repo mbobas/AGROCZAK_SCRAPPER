@@ -20,7 +20,7 @@ from src.core.cache import ProductCache
 console = Console()
 
 
-def create_data_fetcher(render: bool = True):
+def create_data_fetcher(render: bool = False):
     """Tworzy funkcje do pobierania danych przez scrape.do."""
     try:
         from src.api.scraper import create_scrape_fetcher, ScrapeDoClient
@@ -63,10 +63,10 @@ def run_console_mode(args):
     console.print(f"[dim]Konfiguracja: markup {config.min_markup*100:.0f}-{config.max_markup*100:.0f}%, "
                   f"min kupujacych: {config.min_buyers}, TTL: {config.ttl_days} dni[/dim]")
 
-    render = not getattr(args, "no_render", False)
+    render = bool(getattr(args, "render", False))
     if not render:
         console.print(
-            "[yellow]Uwaga: --no-render — taniej (~1 kred.), ale Allegro moze zwrocic "
+            "[yellow]Uwaga: render JS wylaczony (uzyj --render dla pelniejszego listingu) — taniej (~1 kred.), ale Allegro moze zwrocic "
             "mniej ofert albo bez liczby kupujacych; czasem 0 wynikow.[/yellow]"
         )
 
@@ -141,9 +141,9 @@ def main():
     run_parser.add_argument("-o", "--output", help="Plik wyjsciowy JSON (domyslnie: data/output/results_DATA.json)")
     run_parser.add_argument("-c", "--config", default="config.yaml", help="Plik konfiguracji")
     run_parser.add_argument(
-        "--no-render",
+        "--render",
         action="store_true",
-        help="Bez headless JS (~1 kred./kod zamiast ~5). Moze dac mniej ofert / bez kupujacych.",
+        help="Wlacz headless JS (~5 kred./kod zamiast ~1). Pelniejszy listing.",
     )
 
     subparsers.add_parser("test", help="Testuj polaczenie ze scrape.do")

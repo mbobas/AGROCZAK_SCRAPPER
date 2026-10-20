@@ -70,8 +70,12 @@ def _token_matches(token: str, title_tokens: List[str], title_codes: set) -> boo
     return False
 
 
-def name_match_pct(my_name: Optional[str], offer_title: Optional[str]) -> Optional[float]:
-    """Procent slow z my_name znalezionych w offer_title. None gdy brak nazwy."""
+def name_match_pct(
+    my_name: Optional[str], offer_title: Optional[str], code: Optional[str] = None
+) -> Optional[float]:
+    """Procent slow z my_name w offer_title; 100 gdy kod produktu jest w tytule. None gdy brak nazwy i kodu w tytule."""
+    if code_in_title(code, offer_title):
+        return 100.0
     if not my_name or not str(my_name).strip():
         return None
     tokens = name_tokens(str(my_name))
@@ -82,3 +86,32 @@ def name_match_pct(my_name: Optional[str], offer_title: Optional[str]) -> Option
     title_codes = {_code_key(t) for t in title_tokens}
     hits = sum(1 for t in tokens if _token_matches(t, title_tokens, title_codes))
     return round(hits / len(tokens) * 100, 1)
+
+
+_NOISE = {"oryginal", "oryginalny", "zamiennik", "szt"}
+
+
+def build_search_query(name: Optional[str]) -> str:
+    """Fraza do wyszukiwarki Allegro: nazwa bez szumu (oryginal, zamiennik, symbole)."""
+    if not name:
+        return ""
+    raw = re.sub(r"[Øø()\[\],;:]", " ", str(name))
+    words = [w for w in raw.split() if normalize(w).strip("-/.") not in _NOISE]
+    return " ".join(words).strip()
+
+
+def code_in_title(code: Optional[str], title: Optional[str]) -> bool:
+    """True gdy caly kod produktu wystepuje w tytule (SW-378311 == SW378311 == sw 378311)."""
+    key = _code_key(normalize(str(code or "")))
+    if len(key) < 5 or not any(c.isdigit() for c in key):
+        return False
+    parts = [p for p in re.split(r"[^a-z0-9]+", normalize(title or "")) if p]
+    for i in range(len(parts)):
+        joined = ""
+        for p in parts[i:]:
+            joined += p
+            if joined == key:
+                return True
+            if len(joined) >= len(key):
+                break
+    return False

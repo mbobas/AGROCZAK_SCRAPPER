@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from .matching import name_match_pct
+from .matching import code_in_title, name_match_pct
 
 OUTPUT_DIR = Path("data/output")
 LATEST_NAME = "results_latest.json"
@@ -35,7 +35,18 @@ def dedupe_offers(offers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def offer_match_pct(product: Dict[str, Any], offer: Dict[str, Any]) -> Optional[float]:
     """Dopasowanie nazwy produktu do tytulu oferty (None gdy brak nazwy)."""
-    return name_match_pct(product.get("name"), offer.get("title"))
+    return name_match_pct(product.get("name"), offer.get("title"), product.get("ean"))
+
+
+def offer_match_reason(product: Dict[str, Any], offer: Dict[str, Any]) -> str:
+    """Skad dopasowanie: kod (kod w tytule), slowa (z nazwy) lub pusty."""
+    if code_in_title(product.get("ean"), offer.get("title")):
+        return "kod"
+    return "slowa" if product.get("name") else ""
+
+
+def _mode_label(product: Dict[str, Any]) -> str:
+    return "Nazwa" if product.get("search_mode") == "name" else "Kod"
 
 
 def _match_ok(product: Dict[str, Any], offer: Dict[str, Any], min_match_pct: float) -> bool:
@@ -179,6 +190,7 @@ def summary_row(
     return {
         "Kod": product.get("ean"),
         "Nazwa": product.get("name"),
+        "Tryb": _mode_label(product),
         "Moja cena": product.get("my_price"),
         "Znaleziono": "✅ tak" if product.get("found_on_allegro") else "❌ nie",
         "Liczba ofert": stats["offers_count"],
@@ -222,8 +234,10 @@ def flatten_offers(
                 {
                     "Kod": product.get("ean"),
                     "Nazwa": product.get("name"),
+                    "Tryb": _mode_label(product),
                     "Moja cena": my_price,
                     "Dopasowanie %": offer_match_pct(product, offer),
+                    "Powód": offer_match_reason(product, offer),
                     "Tytuł": offer.get("title"),
                     "Cena": price or None,
                     "Marża %": markup,

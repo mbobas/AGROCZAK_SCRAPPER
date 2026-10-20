@@ -11,6 +11,7 @@ from typing import List, Dict, Any, Optional, Callable
 import yaml
 
 from .cache import ProductCache
+from .matching import build_search_query, normalize
 
 
 @dataclass
@@ -45,6 +46,8 @@ class ProductResult:
     status: str = "pending"  # pending, checked, error
     error_message: Optional[str] = None
     from_cache: bool = False
+    search_mode: str = "code"  # code | name
+    search_query: Optional[str] = None
     
     def to_dict(self) -> Dict[str, Any]:
         result = asdict(self)
@@ -92,7 +95,9 @@ class ProductProcessor:
     """Glowny procesor do sprawdzania produktow na Allegro."""
     
     def __init__(self, config: Optional[ProcessorConfig] = None,
-                 data_fetcher: Optional[Callable] = None):
+                 data_fetcher: Optional[Callable] = None,
+                 search_mode: str = "code"):
+        self.search_mode = search_mode if search_mode in ("code", "name") else "code"
         self.config = config or ProcessorConfig.from_yaml()
         self.cache = ProductCache()
         self.data_fetcher = data_fetcher  # funkcja do pobierania danych z Allegro
@@ -147,10 +152,24 @@ class ProductProcessor:
             my_price=product.my_price,
             name=product.name,
             checked_at=datetime.now().isoformat(),
+            search_mode=self.search_mode,
         )
         
+        if self.search_mode == "name":
+            query = build_search_query(product.name)
+            cache_key = f"name::{normalize(query)}"
+        else:
+            query = product.ean
+            cache_key = product.ean
+        result.search_query = query
+        
+        if not query:
+            result.status = "error"
+            result.error_message = "Brak nazwy produktu do wyszukania"
+            return result
+        
         # Sprawdz cache
-        cached = self.cache.get_if_valid(product.ean, self.config.ttl_days)
+        cached = self.cache.get_if_valid(cache_key, self.config.ttl_days)
         if cached:
             field_names = set(ProductResult.__dataclass_fields__.keys())
             data = {k: v for k, v in cached.items() if k in field_names}
@@ -158,6 +177,9 @@ class ProductProcessor:
             # Nazwa i cena z biezacego wejscia (cache moze pochodzic ze starego formatu)
             data["name"] = product.name or data.get("name")
             data["my_price"] = product.my_price
+            data["ean"] = product.ean
+            data["search_mode"] = self.search_mode
+            data["search_query"] = query
             return ProductResult(**data)
         
         if not self.data_fetcher:
@@ -167,12 +189,12 @@ class ProductProcessor:
         
         try:
             # Pobierz dane z Allegro
-            offers_data = self.data_fetcher(product.ean)
+            offers_data = self.data_fetcher(query)
             
             if not offers_data:
                 result.status = "checked"
                 result.found_on_allegro = False
-                self.cache.set(product.ean, result.to_dict())
+                self.cache.set(cache_key, result.to_dict())
                 return result
             
             result.found_on_allegro = True
@@ -194,7 +216,7 @@ class ProductProcessor:
                 )
             
             result.status = "checked"
-            self.cache.set(product.ean, result.to_dict())
+            self.cache.set(cache_key, result.to_dict())
             
         except Exception as e:
             result.status = "error"

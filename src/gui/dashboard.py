@@ -65,8 +65,10 @@ def init_session_state():
     if "current_ean" not in st.session_state:
         st.session_state.current_ean = None
     st.session_state.data_source = "scrape_do"
+    if "search_mode" not in st.session_state:
+        st.session_state.search_mode = "Kod"
     if "use_render" not in st.session_state:
-        st.session_state.use_render = True
+        st.session_state.use_render = False
     if "last_autosave_path" not in st.session_state:
         st.session_state.last_autosave_path = None
     if "analyze_products" not in st.session_state:
@@ -134,10 +136,11 @@ def build_data_fetcher():
         st.error("Brak tokena scrape.do w .env — nie można uruchomić scrapowania.")
         return None
 
-    render = bool(st.session_state.get("use_render", True))
+    render = bool(st.session_state.get("use_render", False))
 
-    def fetch_scrape(ean: str) -> list[dict]:
-        offers = search_allegro_by_ean(ean, client, render=render)
+    def fetch_scrape(query: str) -> list[dict]:
+        # query = kod produktu (tryb Kod) albo fraza z nazwy (tryb Nazwa)
+        offers = search_allegro_by_ean(query, client, render=render)
         return [
             {
                 "offer_id": o.offer_id,
@@ -264,10 +267,10 @@ def sidebar_config():
     st.sidebar.toggle(
         "Render JS (headless)",
         key="use_render",
-        help="ON ≈ 5 kred./kod (pełniejszy listing). OFF ≈ 1 kred./kod (tańszy, mniej wiarygodny).",
+        help="OFF (domyślnie) ≈ 1 kred./zapytanie. ON ≈ 5 kred./zapytanie (pełniejszy listing).",
     )
     if st.session_state.use_render:
-        st.sidebar.caption("~5 kred./kod — pełniejszy listing (zalecane).")
+        st.sidebar.caption("~5 kred./zapytanie — pełniejszy listing.")
     else:
         st.sidebar.warning(
             "Bez renderu taniej (~1 kred.), ale Allegro może zwrócić mniej ofert "
@@ -335,7 +338,7 @@ def sidebar_config():
             st.sidebar.caption(f"Równoczesne zapytania: {concurrent}")
             
             # Koszty — aktywny tryb
-            active = st.session_state.get("use_render", True)
+            active = st.session_state.get("use_render", False)
             if active:
                 st.sidebar.caption("**Aktywny tryb:** render ON → ~5 kred./zapytanie")
             else:
@@ -453,7 +456,7 @@ def range_section(df: pd.DataFrame) -> pd.DataFrame:
             max_monthly = info.get("MaxMonthlyRequest")
             if max_monthly is not None:
                 client.stats.max_monthly_credits = max_monthly
-        use_render = bool(st.session_state.get("use_render", True))
+        use_render = bool(st.session_state.get("use_render", False))
         estimate = client.estimate_cost(1, render=use_render)
         can_process = estimate.get("can_process")
     st.session_state.range_can_process = can_process
@@ -539,7 +542,7 @@ def cost_estimate_section(num_products: int):
 
     st.subheader("💰 Szacowany koszt")
 
-    use_render = bool(st.session_state.get("use_render", True))
+    use_render = bool(st.session_state.get("use_render", False))
     estimate = client.estimate_cost(num_products, render=use_render)
     cost_per = estimate.get("cost_per_request", 5 if use_render else 1)
     st.caption(
@@ -1065,22 +1068,51 @@ def scrape_tab() -> None:
 
     can_start = True
     selected_df = None
+    st.segmented_control(
+        "Szukaj po",
+        options=["Kod", "Nazwa"],
+        key="search_mode",
+        selection_mode="single",
+        disabled=bool(st.session_state.running),
+        help="Kod = fraza to kod produktu. Nazwa = fraza zbudowana z kolumny `nazwa`. "
+        "Brak zaznaczenia = Kod.",
+    )
+    by_name = st.session_state.search_mode == "Nazwa"
+    if by_name:
+        st.info(
+            "Tryb **Nazwa**: wyszukiwana jest nazwa z kolumny `nazwa` "
+            "(bez słów typu „oryginał”). Dopasowanie % policzysz w Analizie wyników."
+        )
+
     if df is not None and len(df) > 0:
         selected_df = range_section(df)
         can_start = cost_estimate_section(len(selected_df))
+        if by_name:
+            has_name_col = any(str(c).strip().lower() in ("nazwa", "name") for c in df.columns)
+            if not has_name_col:
+                st.error("Plik nie ma kolumny `nazwa` — nie można szukać po nazwie.")
+                can_start = False
 
     start_btn, pause_btn, resume_btn, stop_btn = control_section()
 
     if start_btn and selected_df is not None and can_start:
         products = df_to_input_products(selected_df)
+        if by_name:
+            skipped = sum(1 for p in products if not (p.name or "").strip())
+            products = [p for p in products if (p.name or "").strip()]
+            if skipped:
+                st.warning(f"Pominięto {skipped} produktów bez nazwy.")
         if not products:
-            st.error("Brak produktów z kodem w wybranym zakresie.")
+            st.error("Brak produktów z kodem (i nazwą w trybie Nazwa) w wybranym zakresie.")
         else:
             fetcher = build_data_fetcher()
             if fetcher is not None:
                 st.session_state.processor = ProductProcessor(
                     config=st.session_state.config,
                     data_fetcher=fetcher,
+                    search_mode=(
+                        "name" if st.session_state.search_mode == "Nazwa" else "code"
+                    ),
                 )
                 st.session_state.job_products = products
                 st.session_state.job_index = 0
@@ -1093,7 +1125,7 @@ def scrape_tab() -> None:
                 st.session_state.selected_df = selected_df
                 st.session_state.last_autosave_path = None
                 refresh_credits_info()
-                render_label = "on" if st.session_state.get("use_render", True) else "off"
+                render_label = "on" if st.session_state.get("use_render", False) else "off"
                 st.info(
                     f"Przetwarzanie wierszy "
                     f"{st.session_state.range_start}–{st.session_state.range_end} "

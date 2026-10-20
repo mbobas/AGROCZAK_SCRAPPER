@@ -113,6 +113,8 @@ Obsługiwany jest też format `Kod produktu;nazwa;brutto` (nazwa opcjonalna).
 Gdy podana jest nazwa, w analizie wyników liczone jest **dopasowanie %**: udział
 znaczących słów z nazwy znalezionych w tytule oferty Allegro (np. 3 z 4 słów = 75%).
 W zakładce „Analiza wyników” można filtrować suwakiem „Min. dopasowanie nazwy”.
+Jeśli tytuł oferty zawiera cały kod produktu (np. `SW-378311` = `SW378311`; kod min. 5 znaków z cyfrą),
+dopasowanie to automatycznie 100% (kolumna „Powód” = `kod`).
 Liczone lokalnie, bez dodatkowych kredytów.
 
 Kolumny:
@@ -125,10 +127,16 @@ Kolumny:
 
 | Tryb | Kredyty/zapytanie | Uwagi |
 |------|-------------------|-------|
-| `render=true` | 5 | Z JavaScript - pełne dane |
-| `render=false` | 1 | Bez JS - może brakować danych |
+| `render=true` | 5 | Z JavaScript - pełne dane (włącz w sidebarze lub `--render` w CLI) |
+| `render=false` | 1 | Bez JS - **domyślnie**, może brakować danych |
 
-Darmowy plan: **1000 kredytów/miesiąc** = ~200 produktów z pełnymi danymi
+Darmowy plan: **1000 kredytów/miesiąc** = ~1000 produktów (render OFF) lub ~200 (render ON)
+
+### Tryb wyszukiwania (Kod / Nazwa)
+
+W zakładce Scrapowanie przełącznik „Szukaj po” wybiera, czy fraza do Allegro to kod
+produktu, czy nazwa z kolumny `nazwa`. Cache osobno dla obu trybów; kolumna „Tryb”
+w wynikach pokazuje, jak szukano.
 
 ## Struktura projektu
 
