@@ -41,7 +41,8 @@ def offer_match_pct(product: Dict[str, Any], offer: Dict[str, Any]) -> Optional[
 def offer_match_reason(product: Dict[str, Any], offer: Dict[str, Any]) -> str:
     """Skad dopasowanie: kod (kod w tytule), slowa (z nazwy) lub pusty."""
     if code_in_title(product.get("ean"), offer.get("title")):
-        return "kod"
+        pct = offer_match_pct(product, offer)
+        return "kod+nazwa" if pct is not None and pct >= 100 else "tylko kod"
     return "slowa" if product.get("name") else ""
 
 

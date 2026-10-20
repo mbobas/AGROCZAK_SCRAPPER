@@ -107,3 +107,18 @@ def test_regression_latest_results():
     rows = flatten_offers(products, markup_min_pct=0, markup_max_pct=9)
     for m in _markups(rows):
         assert m is not None and 0 <= m <= 9
+
+
+def test_min_match_100_requires_code_and_name():
+    p = _product(
+        [
+            _offer("a", 100, title="Filtr paliwa 2654407"),  # kod + nazwa -> 100
+            _offer("b", 100, title="Pompa 2654407"),  # tylko kod -> 90
+            _offer("c", 100, title="Filtr paliwa"),  # sama nazwa -> 99
+        ],
+        ean="2654407",
+    )
+    ids = {o["offer_id"] for o in filter_offers(p, min_match_pct=100)}
+    assert ids == {"a"}
+    ids = {o["offer_id"] for o in filter_offers(p, min_match_pct=90)}
+    assert ids == {"a", "b", "c"}

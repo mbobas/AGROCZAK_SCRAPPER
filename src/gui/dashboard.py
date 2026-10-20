@@ -672,6 +672,8 @@ Gdy zacieśnisz filtry, liczba spada. Min. kupujących = 0 → oferty bez `buyer
 (bez słów typu „oryginał”, „do”) występuje w tytule oferty Allegro; w podsumowaniu
 najlepszy wynik spośród ofert. Np. 3 z 4 słów = 75%. Odmiana słów i polskie znaki
 są tolerowane; numery katalogowe muszą się zgadzać dokładnie.
+**100%** tylko gdy kod produktu jest w tytule i pasuje choć jedno słowo z nazwy;
+sama nazwa daje max 99%, sam kod (bez słów z nazwy) 90%.
 
 **Znaleziono** — czy listing zwrócił jakiekolwiek oferty (niezależnie od filtrów).
 
@@ -714,6 +716,10 @@ def results_section():
         f"min. kupujących = {cfg.min_buyers} "
         f"(zmiana filtrów odświeża kolumnę bez ponownego scrapu)."
     )
+
+    from src.core.matching import match_legend_text
+
+    st.caption("Legenda dopasowania: " + match_legend_text())
 
     filter_col1, filter_col2 = st.columns(2)
     with filter_col1:
@@ -793,6 +799,7 @@ def results_section():
 
 def analyze_section():
     """Zakładka: wczytaj JSON wyników i filtruj lokalnie (bez kredytów)."""
+    from src.core.matching import match_legend_text
     from src.core.results_io import (
         analyzer_summary_row,
         filter_products,
@@ -911,6 +918,7 @@ def analyze_section():
     )
     if not has_names:
         min_match = 0
+    st.caption("Legenda dopasowania: " + match_legend_text())
 
     m_lo = None if markup_range[0] <= -110 else float(markup_range[0])
     m_hi = None if markup_range[1] >= 110 else float(markup_range[1])

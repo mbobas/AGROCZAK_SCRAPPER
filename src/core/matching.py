@@ -16,6 +16,26 @@ STOP_WORDS = {
 _PL_MAP = str.maketrans({"ł": "l", "Ł": "l", "ø": "o", "Ø": "o"})
 MIN_PREFIX = 5
 
+CODE_AND_NAME_PCT = 100.0  # kod w tytule + slowo z nazwy
+CODE_ONLY_PCT = 90.0  # kod w tytule, bez slow z nazwy
+NAME_ONLY_MAX_PCT = 99.0  # sama nazwa, bez kodu
+
+# (od %, do %, opis) - od najwyzszego; zrodlo legendy w UI
+MATCH_TIERS = [
+    (100, 100, "kod w tytule + słowo z nazwy"),
+    (90, 90, "kod w tytule, bez słów z nazwy"),
+    (75, 99, "większość słów z nazwy (bez kodu max 99)"),
+    (50, 74, "połowa słów — do ręcznego sprawdzenia"),
+    (0, 49, "słabe dopasowanie, prawdopodobnie inny produkt"),
+]
+
+
+def match_legend_text() -> str:
+    return " · ".join(
+        (f"**{lo}%**" if lo == hi else f"**{lo}–{hi}%**") + f" {desc}"
+        for lo, hi, desc in MATCH_TIERS
+    )
+
 
 def normalize(text: str) -> str:
     text = (text or "").translate(_PL_MAP)
@@ -73,19 +93,33 @@ def _token_matches(token: str, title_tokens: List[str], title_codes: set) -> boo
 def name_match_pct(
     my_name: Optional[str], offer_title: Optional[str], code: Optional[str] = None
 ) -> Optional[float]:
-    """Procent slow z my_name w offer_title; 100 gdy kod produktu jest w tytule. None gdy brak nazwy i kodu w tytule."""
-    if code_in_title(code, offer_title):
-        return 100.0
-    if not my_name or not str(my_name).strip():
-        return None
-    tokens = name_tokens(str(my_name))
+    """
+    Dopasowanie nazwy/kodu do tytulu oferty (0-100):
+      - kod w tytule + >= 1 slowo z nazwy (poza samym kodem): 100
+      - kod w tytule, bez slow z nazwy / brak nazwy: 90
+      - bez kodu w tytule: procent slow z nazwy, max 99
+      - brak nazwy i kodu w tytule: None
+    """
+    has_code = code_in_title(code, offer_title)
+    tokens = name_tokens(str(my_name)) if my_name and str(my_name).strip() else []
     if not tokens:
-        return None
+        return CODE_ONLY_PCT if has_code else None
+
     title_tokens = [_clean(t) for t in tokenize(offer_title or "")]
     title_tokens = [t for t in title_tokens if t]
     title_codes = {_code_key(t) for t in title_tokens}
-    hits = sum(1 for t in tokens if _token_matches(t, title_tokens, title_codes))
-    return round(hits / len(tokens) * 100, 1)
+    code_key = _code_key(normalize(str(code or "")))
+    hits = 0
+    word_hits = 0  # trafienia bez samego kodu produktu
+    for t in tokens:
+        if _token_matches(t, title_tokens, title_codes):
+            hits += 1
+            if not (code_key and _code_key(t) == code_key):
+                word_hits += 1
+    if has_code:
+        return CODE_AND_NAME_PCT if word_hits > 0 else CODE_ONLY_PCT
+    pct = round(hits / len(tokens) * 100, 1)
+    return max(0.0, min(NAME_ONLY_MAX_PCT, pct))
 
 
 _NOISE = {"oryginal", "oryginalny", "zamiennik", "szt"}

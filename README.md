@@ -8,6 +8,7 @@ Aplikacja do monitorowania cen i sprzedaży produktów na Allegro na podstawie k
 - Sprawdzanie cen na Allegro
 - Informacja o sprzedaży ("X osób kupiło")
 - Filtrowanie po marży cenowej (np. 12-15%)
+- Dopasowanie oferty: 100% = kod w tytule + słowo z nazwy; 90% = sam kod; sama nazwa max 99%; legenda nad wynikami
 - Analiza wyników: filtry (marża z końcami -∞/+∞, min. kupujących, dopasowanie nazwy) działają na poziomie ofert; min. kupujących = 0 przepuszcza oferty bez danych, od 1 je ukrywa
 - Cache wyników (SQLite)
 - Tryb konsolowy i GUI (Streamlit)
