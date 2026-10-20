@@ -16,13 +16,16 @@ warnings.filterwarnings('ignore')
 # Dodaj sciezke
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+import requests
 import streamlit as st
 import pandas as pd
+from dotenv import load_dotenv
 
 from src.core.processor import ProductProcessor, ProcessorConfig, InputProduct, ProductResult
 from src.core.cache import ProductCache
 from src.api.scraper import ScrapeDoClient, search_allegro_by_ean
 
+load_dotenv()
 
 st.set_page_config(
     page_title="Allegro Price Monitor",
@@ -31,6 +34,10 @@ st.set_page_config(
 )
 
 CLOUD_APP_HOST = "agroczakscrapper-5nmik62ymzukf8hpefafsn.streamlit.app"
+AUTH_WEBHOOK_URL = (
+    "https://marcin286-20286.wykr.es/webhook/68fe834b-69fc-4ee4-8170-f443b66caa1e"
+)
+AUTH_REQUEST_TIMEOUT_S = 15
 
 
 def _request_host() -> str:
@@ -67,8 +74,59 @@ def is_analyze_only() -> bool:
     return False
 
 
+def verify_password(password: str) -> tuple[bool, str]:
+    """
+    Weryfikuje hasło przez POST na webhook n8n.
+    Sukces = HTTP 200. Hasło idzie jako query param `password`.
+    """
+    password = (password or "").strip()
+    if not password:
+        return False, "Podaj hasło."
+
+    try:
+        response = requests.post(
+            AUTH_WEBHOOK_URL,
+            params={"password": password},
+            timeout=AUTH_REQUEST_TIMEOUT_S,
+            verify=False,
+        )
+    except requests.RequestException as exc:
+        return False, f"Błąd połączenia z weryfikacją: {exc}"
+
+    if response.status_code == 200:
+        return True, ""
+    return False, "Nieprawidłowe hasło."
+
+
+def require_login() -> bool:
+    """
+    Bramka wejścia: pokazuje formularz hasła, dopóki sesja nie jest uwierzytelniona.
+    Zwraca True gdy użytkownik może korzystać z aplikacji.
+    """
+    if st.session_state.get("authenticated"):
+        return True
+
+    st.title("Allegro Price Monitor")
+    st.caption("Aby wejść, podaj hasło dostępu.")
+
+    with st.form("login_form", clear_on_submit=False):
+        password = st.text_input("Hasło", type="password", autocomplete="current-password")
+        submitted = st.form_submit_button("Zaloguj", type="primary", use_container_width=True)
+
+    if submitted:
+        ok, message = verify_password(password)
+        if ok:
+            st.session_state.authenticated = True
+            st.rerun()
+        st.error(message or "Nieprawidłowe hasło.")
+
+    return False
+
+
 def init_session_state():
     """Inicjalizuje stan sesji."""
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
     if "processor" not in st.session_state:
         st.session_state.processor = None
     if "results" not in st.session_state:
@@ -1218,6 +1276,9 @@ def scrape_tab() -> None:
 def main():
     init_session_state()
 
+    if not require_login():
+        return
+
     if is_analyze_only():
         st.title("Allegro Price Monitor")
         st.caption(
@@ -1229,6 +1290,9 @@ def main():
             "**Allegro Price Monitor**  \n"
             "Wersja 1.3 · tryb: analyze-only"
         )
+        if st.sidebar.button("Wyloguj"):
+            st.session_state.authenticated = False
+            st.rerun()
         return
 
     st.title("Allegro Price Monitor")
@@ -1253,6 +1317,9 @@ def main():
         """)
 
     st.sidebar.divider()
+    if st.sidebar.button("Wyloguj"):
+        st.session_state.authenticated = False
+        st.rerun()
     st.sidebar.caption("""
     **Allegro Price Monitor**  
     Wersja 1.3 · źródło: scrape.do
