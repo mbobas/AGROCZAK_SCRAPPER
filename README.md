@@ -100,6 +100,15 @@ streamlit run src/gui/dashboard.py
 
 Otworzy się przeglądarka z interfejsem na `http://localhost:8501`
 
+## Deploy (Streamlit Cloud)
+
+> **WAŻNE — widoczność repozytorium**  
+> Żeby Streamlit Cloud **odświeżył się po pushu** i wciągnął nowe zmiany, repozytorium GitHub **musi być publiczne** w momencie deployu / redeployu.  
+> Po udanym wdrożeniu możesz (i tak należy) **z powrotem ustawić repo na private**.  
+> Typowy rytuał: `public` → push / Redeploy w Streamlit → sprawdź, że działa → `private`.
+
+Bez publicznego repo Streamlit często **nie widzi** nowych commitów i zostaje na starej wersji aplikacji.
+
 ## Format pliku wejściowego
 
 Plik CSV z separatorem `;`:
