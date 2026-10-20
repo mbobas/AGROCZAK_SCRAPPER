@@ -2,6 +2,7 @@
 GUI Dashboard - Streamlit interface.
 Uruchom: streamlit run src/gui/dashboard.py
 """
+import os
 import sys
 from pathlib import Path
 from datetime import datetime
@@ -28,6 +29,42 @@ st.set_page_config(
     page_icon="📊",
     layout="wide"
 )
+
+CLOUD_APP_HOST = "agroczakscrapper-5nmik62ymzukf8hpefafsn.streamlit.app"
+
+
+def _request_host() -> str:
+    """Host z nagłówków HTTP Streamlit (bez portu)."""
+    try:
+        headers = st.context.headers
+    except Exception:
+        return ""
+    raw = headers.get("Host") or headers.get("host") or ""
+    return str(raw).split(":")[0].strip().lower()
+
+
+def _app_mode_override() -> str:
+    """APP_MODE z secrets lub env (np. analyze_only do testów lokalnych)."""
+    try:
+        mode = st.secrets.get("APP_MODE")
+        if mode:
+            return str(mode).strip().lower()
+    except Exception:
+        pass
+    return os.getenv("APP_MODE", "").strip().lower()
+
+
+def is_analyze_only() -> bool:
+    """True na Streamlit Cloud (*.streamlit.app) lub gdy APP_MODE=analyze_only."""
+    mode = _app_mode_override()
+    if mode in {"analyze_only", "analyze", "cloud"}:
+        return True
+    host = _request_host()
+    if not host:
+        return False
+    if host == CLOUD_APP_HOST or host.endswith(".streamlit.app"):
+        return True
+    return False
 
 
 def init_session_state():
@@ -1157,10 +1194,24 @@ def scrape_tab() -> None:
 
 
 def main():
+    init_session_state()
+
+    if is_analyze_only():
+        st.title("Allegro Price Monitor")
+        st.caption(
+            "Tryb chmury: tylko analiza wyników (bez scrapowania / kredytów). "
+            "Wgraj plik `results_*.json` z lokalnego uruchomienia."
+        )
+        analyze_section()
+        st.sidebar.caption(
+            "**Allegro Price Monitor**  \n"
+            "Wersja 1.3 · tryb: analyze-only"
+        )
+        return
+
     st.title("Allegro Price Monitor")
     st.caption("Sprawdzanie cen i sprzedaży produktów na Allegro")
 
-    init_session_state()
     sidebar_config()
 
     tab_scrape, tab_analyze = st.tabs(["Scrapowanie", "Analiza wyników"])
