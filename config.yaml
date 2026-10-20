@@ -6,7 +6,7 @@ sales_threshold:
   min_buyers: 0     # 0 = nie wymagaj liczby kupujących (null też OK)
 
 cache:
-  ttl_days: 7       # waznosc danych w dniach
+  ttl_days: 30      # waznosc danych w dniach
 
 rate_limit:
   requests_per_minute: 10  # bezpieczny limit

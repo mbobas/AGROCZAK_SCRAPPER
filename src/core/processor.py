@@ -72,7 +72,7 @@ class ProcessorConfig:
     min_markup: float = 0.0
     max_markup: float = 0.50
     min_buyers: int = 0
-    ttl_days: int = 7
+    ttl_days: int = 30
     delay_seconds: float = 6.0
     
     @classmethod
@@ -84,7 +84,7 @@ class ProcessorConfig:
                 min_markup=config.get("price_threshold", {}).get("min_markup", 0.0),
                 max_markup=config.get("price_threshold", {}).get("max_markup", 0.50),
                 min_buyers=config.get("sales_threshold", {}).get("min_buyers", 0),
-                ttl_days=config.get("cache", {}).get("ttl_days", 7),
+                ttl_days=config.get("cache", {}).get("ttl_days", 30),
                 delay_seconds=config.get("rate_limit", {}).get("delay_between_requests", 6),
             )
         except FileNotFoundError:

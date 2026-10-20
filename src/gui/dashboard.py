@@ -423,7 +423,7 @@ def sidebar_config():
     
     st.sidebar.subheader("Cache")
     ttl_days = st.sidebar.number_input(
-        "Ważność danych (dni)", 1, 30, config.ttl_days
+        "Ważność danych (dni)", 1, 90, config.ttl_days
     )
     
     st.sidebar.subheader("Rate limiting")

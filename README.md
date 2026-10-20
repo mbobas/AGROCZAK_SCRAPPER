@@ -73,7 +73,7 @@ sales_threshold:
   min_buyers: 1     # minimum "X osób kupiło"
 
 cache:
-  ttl_days: 7       # ważność danych w dniach
+  ttl_days: 30      # ważność danych w dniach
 ```
 
 ## Użycie
