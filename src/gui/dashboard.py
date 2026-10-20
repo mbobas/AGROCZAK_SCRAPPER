@@ -25,7 +25,7 @@ from src.api.scraper import ScrapeDoClient, search_allegro_by_ean
 
 
 st.set_page_config(
-    page_title="Allegro Price Monitor",
+    page_title="Allegro Price Monitor_v1.1",
     page_icon="📊",
     layout="wide"
 )
