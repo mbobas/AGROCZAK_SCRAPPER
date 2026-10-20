@@ -8,6 +8,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from .matching import name_match_pct
+
 OUTPUT_DIR = Path("data/output")
 LATEST_NAME = "results_latest.json"
 
@@ -31,12 +33,25 @@ def dedupe_offers(offers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+def offer_match_pct(product: Dict[str, Any], offer: Dict[str, Any]) -> Optional[float]:
+    """Dopasowanie nazwy produktu do tytulu oferty (None gdy brak nazwy)."""
+    return name_match_pct(product.get("name"), offer.get("title"))
+
+
+def _match_ok(product: Dict[str, Any], offer: Dict[str, Any], min_match_pct: float) -> bool:
+    if min_match_pct <= 0:
+        return True
+    pct = offer_match_pct(product, offer)
+    return pct is not None and pct >= min_match_pct
+
+
 def count_matching_offers(
     product: Dict[str, Any],
     *,
     min_markup: float = 0.0,
     max_markup: float = 0.50,
     min_buyers: int = 0,
+    min_match_pct: float = 0.0,
 ) -> List[Dict[str, Any]]:
     """
     Oferty pasujące do bieżących filtrów (marża + kupujący).
@@ -63,6 +78,8 @@ def count_matching_offers(
             buyers = offer.get("buyers_count")
             if buyers is None or int(buyers) < min_buyers:
                 continue
+        if not _match_ok(product, offer, min_match_pct):
+            continue
         matched.append(offer)
     return matched
 
@@ -73,6 +90,7 @@ def offer_stats(
     min_markup: Optional[float] = None,
     max_markup: Optional[float] = None,
     min_buyers: Optional[int] = None,
+    min_match_pct: float = 0.0,
 ) -> Dict[str, Any]:
     """Statystyki ofert produktu (po dedupie). Pasujące wg podanych filtrów lub zapisanych matching_offers."""
     offers = dedupe_offers(product.get("offers") or [])
@@ -106,9 +124,15 @@ def offer_stats(
             min_markup=min_markup,
             max_markup=max_markup,
             min_buyers=min_buyers,
+            min_match_pct=min_match_pct,
         )
     else:
         matching = product.get("matching_offers") or []
+
+    match_values = [
+        m for m in (offer_match_pct(product, o) for o in offers) if m is not None
+    ]
+    best_match_pct = max(match_values) if match_values else None
 
     return {
         "offers_count": len(offers),
@@ -120,6 +144,7 @@ def offer_stats(
         "markup_min_pct": markup_min,
         "matching_count": len(matching),
         "matching_offers": matching,
+        "best_match_pct": best_match_pct,
     }
 
 
@@ -141,6 +166,7 @@ def summary_row(
     min_markup: Optional[float] = None,
     max_markup: Optional[float] = None,
     min_buyers: Optional[int] = None,
+    min_match_pct: float = 0.0,
 ) -> Dict[str, Any]:
     """Jeden wiersz tabeli podsumowania. Filtry opcjonalne — do żywego „Pasujące”."""
     stats = offer_stats(
@@ -148,9 +174,11 @@ def summary_row(
         min_markup=min_markup,
         max_markup=max_markup,
         min_buyers=min_buyers,
+        min_match_pct=min_match_pct,
     )
     return {
         "Kod": product.get("ean"),
+        "Nazwa": product.get("name"),
         "Moja cena": product.get("my_price"),
         "Znaleziono": "✅ tak" if product.get("found_on_allegro") else "❌ nie",
         "Liczba ofert": stats["offers_count"],
@@ -158,6 +186,7 @@ def summary_row(
         "Cena max": stats["max_price"],
         "Najtańsza oferta": stats["cheapest_title"],
         "Marża min %": stats["markup_min_pct"],
+        "Dopasowanie max %": stats["best_match_pct"],
         "Pasujące": stats["matching_count"],
         "Status": format_status(product.get("status")),
         "Cache": "tak" if product.get("from_cache") else "",
@@ -166,12 +195,22 @@ def summary_row(
 
 
 
-def flatten_offers(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Spłaszcza produkty × oferty (po dedupie)."""
+def flatten_offers(
+    products: List[Dict[str, Any]], *, min_match_pct: float = 0.0
+) -> List[Dict[str, Any]]:
+    """Spłaszcza produkty × oferty (po dedupie); oferty poniżej progu dopasowania pomijane."""
     rows: List[Dict[str, Any]] = []
     for product in products:
         my_price = float(product.get("my_price") or 0)
-        for offer in dedupe_offers(product.get("offers") or []):
+        product_offers = [
+            o
+            for o in dedupe_offers(product.get("offers") or [])
+            if _match_ok(product, o, min_match_pct)
+        ]
+        product_offers.sort(
+            key=lambda o: -(offer_match_pct(product, o) or 0.0)
+        )
+        for offer in product_offers:
             try:
                 price = float(offer.get("price") or 0)
             except (TypeError, ValueError):
@@ -182,7 +221,9 @@ def flatten_offers(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             rows.append(
                 {
                     "Kod": product.get("ean"),
+                    "Nazwa": product.get("name"),
                     "Moja cena": my_price,
+                    "Dopasowanie %": offer_match_pct(product, offer),
                     "Tytuł": offer.get("title"),
                     "Cena": price or None,
                     "Marża %": markup,
@@ -259,6 +300,7 @@ def filter_products(
     min_buyers: Optional[int] = None,
     require_buyers: bool = False,
     match_mode: str = "any_in_range",
+    min_match_pct: float = 0.0,
 ) -> List[Dict[str, Any]]:
     """
     Lokalne filtrowanie produktów.
@@ -287,6 +329,8 @@ def filter_products(
                 return False
             markup = (price / my_price - 1) * 100
             if markup < markup_min_pct or markup > markup_max_pct:
+                return False
+            if not _match_ok(product, offer, min_match_pct):
                 return False
             if require_buyers:
                 buyers = offer.get("buyers_count")

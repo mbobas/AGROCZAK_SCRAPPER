@@ -108,8 +108,16 @@ ean;cena;nazwa
 5060512512509;50.00;Produkt 2
 ```
 
+Obsługiwany jest też format `Kod produktu;nazwa;brutto` (nazwa opcjonalna).
+
+Gdy podana jest nazwa, w analizie wyników liczone jest **dopasowanie %**: udział
+znaczących słów z nazwy znalezionych w tytule oferty Allegro (np. 3 z 4 słów = 75%).
+W zakładce „Analiza wyników” można filtrować suwakiem „Min. dopasowanie nazwy”.
+Liczone lokalnie, bez dodatkowych kredytów.
+
 Kolumny:
-- `ean` / `EAN` / `kod` / `code` - kod EAN produktu (wymagane)
+- `Kod produktu` / `ean` / `EAN` / `kod` / `code` - kod produktu (wymagane)
+- `brutto` - Twoja cena (alias `cena`)
 - `cena` / `price` / `my_price` - Twoja cena (wymagane)
 - `nazwa` / `name` - nazwa produktu (opcjonalne)
 

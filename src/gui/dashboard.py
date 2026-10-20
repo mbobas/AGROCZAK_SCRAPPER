@@ -382,7 +382,11 @@ def upload_section():
     
     if uploaded_file:
         try:
-            df = pd.read_csv(uploaded_file, sep=";")
+            try:
+                df = pd.read_csv(uploaded_file, sep=";")
+            except UnicodeDecodeError:
+                uploaded_file.seek(0)
+                df = pd.read_csv(uploaded_file, sep=";", encoding="cp1250")
             st.success(f"Wczytano {len(df)} produktów")
             st.dataframe(df.head(10), width="stretch")
             st.session_state.input_df = df
@@ -659,6 +663,13 @@ Gdy zacieśnisz filtry, liczba spada. Min. kupujących = 0 → oferty bez `buyer
 **Marża min %** — ile % drożej jest *najtańsza* oferta Allegro względem **Moja cena**:
 `(cena_min / moja_cena − 1) × 100`.
 
+**Nazwa** — nazwa produktu z pliku wejściowego (kolumna `nazwa`).
+
+**Dopasowanie % / Dopasowanie max %** — jaki procent znaczących słów z Twojej nazwy
+(bez słów typu „oryginał”, „do”) występuje w tytule oferty Allegro; w podsumowaniu
+najlepszy wynik spośród ofert. Np. 3 z 4 słów = 75%. Odmiana słów i polskie znaki
+są tolerowane; numery katalogowe muszą się zgadzać dokładnie.
+
 **Znaleziono** — czy listing zwrócił jakiekolwiek oferty (niezależnie od filtrów).
 
 **Liczba ofert / Cena min–max** — po deduplikacji `offer_id` z listingu.
@@ -668,7 +679,12 @@ Gdy zacieśnisz filtry, liczba spada. Min. kupujących = 0 → oferty bez `buyer
 
 def results_section():
     """Sekcja wyników scrapowania — podsumowanie ofert + ekspandery."""
-    from src.core.results_io import save_results_json, summary_row, offer_stats
+    from src.core.results_io import (
+        save_results_json,
+        summary_row,
+        offer_stats,
+        offer_match_pct,
+    )
 
     if not st.session_state.results:
         return
@@ -731,6 +747,9 @@ def results_section():
                 offers_df = pd.DataFrame(
                     [
                         {
+                            "Nazwa": r.get("name"),
+                            "Moja cena": r.get("my_price"),
+                            "Dopasowanie %": offer_match_pct(r, o),
                             "Tytuł": o.get("title"),
                             "Cena": o.get("price"),
                             "Sprzedawca": o.get("seller_name"),
@@ -880,8 +899,28 @@ def analyze_section():
             key="analyze_match_mode",
         )
 
+    has_names = any((p.get("name") or "").strip() for p in products)
+    min_match = st.slider(
+        "Min. dopasowanie nazwy (%)",
+        min_value=0,
+        max_value=100,
+        value=0,
+        step=5,
+        key="analyze_min_match",
+        disabled=not has_names,
+        help=(
+            "Udział słów z Twojej nazwy znalezionych w tytule oferty. "
+            "Oferty poniżej progu są ukrywane."
+            if has_names
+            else "Wczytane wyniki nie zawierają nazw produktów (stary format pliku)."
+        ),
+    )
+    if not has_names:
+        min_match = 0
+
     filtered = filter_products(
         products,
+        min_match_pct=float(min_match),
         markup_min_pct=float(markup_range[0]),
         markup_max_pct=float(markup_range[1]),
         min_offers=int(min_offers),
@@ -906,13 +945,14 @@ def analyze_section():
                 min_markup=float(markup_range[0]) / 100.0,
                 max_markup=float(markup_range[1]) / 100.0,
                 min_buyers=int(min_buyers),
+                min_match_pct=float(min_match),
             )
             for p in filtered
         ]
     )
     st.dataframe(summary_df, width="stretch")
 
-    flat = flatten_offers(filtered)
+    flat = flatten_offers(filtered, min_match_pct=float(min_match))
     with st.expander(f"Oferty spłaszczone ({len(flat)})", expanded=True):
         if flat:
             st.dataframe(pd.DataFrame(flat), width="stretch")

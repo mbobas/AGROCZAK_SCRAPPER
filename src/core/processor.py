@@ -155,6 +155,9 @@ class ProductProcessor:
             field_names = set(ProductResult.__dataclass_fields__.keys())
             data = {k: v for k, v in cached.items() if k in field_names}
             data["from_cache"] = True
+            # Nazwa i cena z biezacego wejscia (cache moze pochodzic ze starego formatu)
+            data["name"] = product.name or data.get("name")
+            data["my_price"] = product.my_price
             return ProductResult(**data)
         
         if not self.data_fetcher:
@@ -279,7 +282,7 @@ class ProductProcessor:
         with open(output_path, "w", encoding="utf-8", newline="") as f:
             writer = csv.writer(f, delimiter=";")
             writer.writerow([
-                "EAN", "Moja cena", "Nazwa", "Znaleziono", 
+                "Kod", "Moja cena", "Nazwa", "Znaleziono", 
                 "Najlepsza oferta - cena", "Najlepsza oferta - kupilo osob",
                 "Najlepsza oferta - URL", "Status"
             ])
