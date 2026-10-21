@@ -376,6 +376,53 @@ def autosave_results(
     return save_results_json(results, search_mode=search_mode)
 
 
+def partial_results_path(search_mode: Optional[str] = None) -> Path:
+    """Stała ścieżka partial JSON (nadpisywana w trakcie joba)."""
+    ensure_output_dir()
+    suffix = search_mode_suffix(search_mode)
+    return OUTPUT_DIR / f"results_partial{suffix}.json"
+
+
+def save_partial_results(
+    results: List[Dict[str, Any]],
+    *,
+    search_mode: Optional[str] = None,
+) -> Path:
+    """Nadpisuje partial JSON (zwarty zapis — bez indent, szybciej przy dużych jobach)."""
+    ensure_output_dir()
+    path = partial_results_path(search_mode)
+    return stream_save_product_dicts(results, path)
+
+
+def stream_save_product_dicts(results: List[Any], path: Path) -> Path:
+    """
+    Zapisuje listę produktów do JSON strumieniowo (jeden rekord naraz).
+    Unika json.dumps(cała_lista) które przy 10k+ dubluje RAM i zabija proces.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write('{"generated_at":')
+        f.write(json.dumps(datetime.now().isoformat(), ensure_ascii=False))
+        f.write(',"products":[')
+        first = True
+        for item in results:
+            if item is None:
+                continue
+            if hasattr(item, "to_dict"):
+                data = item.to_dict()
+            elif isinstance(item, dict):
+                data = item
+            else:
+                continue
+            if not first:
+                f.write(",")
+            f.write(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+            first = False
+        f.write("]}")
+    return path
+
+
 def list_result_files() -> List[Path]:
     """Lista plików results_*.json w data/output (najnowsze pierwsze)."""
     ensure_output_dir()

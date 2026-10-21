@@ -87,6 +87,37 @@ class ProductCache:
             return cached.data
         return None
 
+    def get_valid_keys(self, keys: List[str], ttl_days: int) -> set:
+        """
+        Zwraca zbiór kluczy obecnych w cache i niewygasłych — BEZ ładowania data.
+        Używane do podziału hit/miss przy dużych listach (unikamy OOM).
+        """
+        if not keys:
+            return set()
+
+        unique = list(dict.fromkeys(keys))
+        found: set = set()
+        chunk_size = 400
+        cutoff = datetime.now() - timedelta(days=ttl_days)
+
+        with self._lock:
+            with self._connect() as conn:
+                for i in range(0, len(unique), chunk_size):
+                    chunk = unique[i : i + chunk_size]
+                    placeholders = ",".join("?" * len(chunk))
+                    cursor = conn.execute(
+                        f"SELECT ean, checked_at FROM products WHERE ean IN ({placeholders})",
+                        chunk,
+                    )
+                    for ean, checked_at in cursor.fetchall():
+                        try:
+                            checked = datetime.fromisoformat(checked_at)
+                        except (TypeError, ValueError):
+                            continue
+                        if checked >= cutoff:
+                            found.add(ean)
+        return found
+
     def get_many_if_valid(self, keys: List[str], ttl_days: int) -> Dict[str, Dict[str, Any]]:
         """
         Pobiera wiele wpisów z cache w jednym zapytaniu.

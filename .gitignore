@@ -13,6 +13,7 @@ venv/
 # Dane wyjściowe i cache
 # data/output/
 data/cache.db
+data/job_status.json
 data/logs/
 *.log
 

@@ -25,12 +25,28 @@ from dotenv import load_dotenv
 
 from src.core.processor import ProductProcessor, ProcessorConfig, InputProduct, ProductResult
 from src.core.cache import ProductCache
+from src.core.job_state import (
+    clear_status,
+    is_stale_running,
+    read_status,
+    request_pause,
+    request_stop,
+    write_status,
+)
+from src.worker import JOB_INPUT_PATH, spawn_worker, write_job_input
+from src.core.results_io import (
+    autosave_results,
+    load_results_json,
+    partial_results_path,
+)
 from src.api.scraper import (
     ScrapeDoClient,
     search_allegro_by_ean,
     ALLEGRO_CREDITS_RENDER_OFF,
     ALLEGRO_CREDITS_RENDER_ON,
 )
+
+JOB_DRAIN_LIMIT = 200
 
 load_dotenv()
 
@@ -263,6 +279,12 @@ def init_session_state():
         st.session_state.analyze_source_label = None
     if "job_result_queue" not in st.session_state:
         st.session_state.job_result_queue = None
+    if "awaiting_external_job" not in st.session_state:
+        st.session_state.awaiting_external_job = False
+    if "last_partial_reload_at" not in st.session_state:
+        st.session_state.last_partial_reload_at = 0
+    if "job_status_banner" not in st.session_state:
+        st.session_state.job_status_banner = None
     if "job_finished" not in st.session_state:
         st.session_state.job_finished = True
     if "job_workers" not in st.session_state:
@@ -579,19 +601,25 @@ def upload_section():
     
     with col1:
         uploaded_file = st.file_uploader(
-            "Wybierz plik CSV (EAN;cena;nazwa)",
+            "Wybierz plik CSV (Kod produktu;nazwa;brutto)",
             type=["csv"],
-            help="Plik CSV z kolumnami: ean, cena, nazwa (opcjonalnie)"
+            help=(
+                "Główny format: Kod produktu;nazwa;brutto. "
+                "Aliasy: ean/kod, nazwa, cena/brutto."
+            ),
         )
     
     with col2:
-        st.info("""
-        **Format pliku:**
+        st.info(
+            """
+        **Format pliku (Agroczak):**
         ```
-        ean;cena;nazwa
-        5902719471797;100.00;Produkt 1
+        Kod produktu;nazwa;brutto
+        2654407;Filtr oleju;86.00
         ```
-        """)
+        **Aliasy:** `ean;cena;nazwa`
+        """
+        )
     
     if uploaded_file:
         try:
@@ -747,13 +775,55 @@ def range_section(df: pd.DataFrame) -> pd.DataFrame:
     return selected_df
 
 
-def cost_estimate_section(num_products: int):
-    """Sekcja szacowania kosztów."""
+def _count_cache_hits(selected_df: pd.DataFrame, by_name: bool) -> tuple[int, int]:
+    """Zwraca (liczba produktów w zakresie, ile z nich ma ważny wpis w cache)."""
+    products = df_to_input_products(selected_df)
+    if by_name:
+        products = [p for p in products if (p.name or "").strip()]
+    proc = ProductProcessor(
+        config=st.session_state.config,
+        search_mode="name" if by_name else "code",
+    )
+    keys = []
+    for p in products:
+        key, query = proc._cache_key_and_query(p)
+        if query:
+            keys.append(key)
+    valid = proc.cache.get_valid_keys(keys, st.session_state.config.ttl_days)
+    hits = sum(1 for k in keys if k in valid)
+    return len(products), hits
+
+
+def cost_estimate_section(selected_df: pd.DataFrame | None, by_name: bool = False):
+    """Sekcja szacowania kosztów — kredyty liczone tylko dla braków w cache."""
+    num_total = 0 if selected_df is None else len(selected_df)
     client = get_scrape_client()
-    if not client or num_products == 0:
+    if not client or num_total == 0 or _job_is_active():
         return True
 
     st.subheader("💰 Szacowany koszt")
+
+    cache_key = (
+        len(selected_df),
+        str(selected_df.index[0]),
+        str(selected_df.index[-1]),
+        by_name,
+        st.session_state.config.ttl_days,
+    )
+    cached_est = st.session_state.get("_cost_cache")
+    if cached_est and cached_est[0] == cache_key:
+        n_products, n_hits = cached_est[1]
+    else:
+        n_products, n_hits = _count_cache_hits(selected_df, by_name)
+        st.session_state["_cost_cache"] = (cache_key, (n_products, n_hits))
+    if st.button("🔄 Przelicz cache", key="recount_cache_btn"):
+        st.session_state.pop("_cost_cache", None)
+        st.rerun()
+    num_products = max(0, n_products - n_hits)  # tylko braki kosztują kredyty
+    st.caption(
+        f"W zakresie {n_products} produktów, z czego **{n_hits}** jest już w cache "
+        f"(0 kredytów) — do scrapowania: **{num_products}**."
+    )
 
     use_render = bool(st.session_state.get("use_render", False))
     estimate = client.estimate_cost(num_products, render=use_render)
@@ -782,41 +852,67 @@ def cost_estimate_section(num_products: int):
 
     if estimate['enough_credits'] is False:
         st.error(f"⚠️ Za mało kredytów! Potrzebujesz {estimate['total_cost']}, masz {remaining}")
-        st.info(f"Możesz sprawdzić max {estimate['can_process']} produktów")
-        return False
+        st.info(f"Możesz zescrapować max {estimate['can_process']} brakujących produktów")
+        override = st.checkbox(
+            "Rozumiem ryzyko — uruchom mimo to (job może zatrzymać się z błędami "
+            "po wyczerpaniu kredytów; wynik i cache zostaną zachowane, "
+            "potem można wznowić)",
+            key="allow_low_credits",
+        )
+        return bool(override)
     elif estimate['enough_credits']:
         st.success(f"✅ Wystarczająco kredytów ({remaining} dostępnych)")
 
     return True
 
 
+def _job_is_active() -> bool:
+    """Lokalna sesja lub job widoczny w job_status.json."""
+    if st.session_state.running or st.session_state.awaiting_external_job:
+        return True
+    status = read_status()
+    return bool(status.get("running")) and not is_stale_running(status)
+
+
 def control_section():
     """Sekcja kontroli procesu."""
     st.header("🎮 Kontrola")
 
-    running = st.session_state.running
-    paused = st.session_state.paused
+    active = _job_is_active()
+    local_running = active
+    paused = bool(st.session_state.paused)
 
     col1, col2, col3, col4 = st.columns(4)
 
     with col1:
-        start_btn = st.button("▶️ Start", disabled=running)
+        start_btn = st.button("▶️ Start", disabled=active)
     with col2:
-        pause_btn = st.button("⏸️ Pauza", disabled=not running or paused)
+        pause_btn = st.button(
+            "⏸️ Pauza", disabled=not local_running or paused
+        )
     with col3:
-        resume_btn = st.button("▶️ Wznów", disabled=not running or not paused)
+        resume_btn = st.button(
+            "▶️ Wznów", disabled=not local_running or not paused
+        )
     with col4:
-        stop_btn = st.button("⏹️ Stop", disabled=not running)
+        stop_btn = st.button("⏹️ Stop", disabled=not active)
 
     return start_btn, pause_btn, resume_btn, stop_btn
 
 
 def progress_section():
     """Sekcja postępu."""
-    if not (st.session_state.running or st.session_state.results):
+    active = _job_is_active()
+    if not (active or st.session_state.results):
         return
 
     st.header("📈 Postęp")
+
+    if active:
+        st.info(
+            "Job działa w osobnym procesie — możesz odświeżyć stronę (F5), "
+            "postęp jest czytany z `data/job_status.json`."
+        )
 
     progress = st.session_state.progress
     total = st.session_state.total
@@ -825,15 +921,28 @@ def progress_section():
         st.progress(min(progress / total, 1.0))
         st.write(f"Sprawdzono: {progress} / {total}")
 
-    if st.session_state.running and st.session_state.paused:
+    status = read_status()
+    phase = status.get("phase")
+    phase_labels = {
+        "cache_lookup": "Odczyt cache (może chwilę trwać przy dużym zakresie)…",
+        "cache_apply": "Nakładanie wyników z cache…",
+        "scrape": "Scrapowanie braków…",
+        "done": "Zakończono",
+    }
+    if phase and phase in phase_labels and active:
+        st.caption(phase_labels[phase])
+        cache_hits = int(status.get("cache_hits") or 0)
+        scraped = int(status.get("scraped") or 0)
+        if cache_hits or scraped:
+            st.caption(f"Cache: {cache_hits} · Pobrane z sieci: {scraped}")
+
+    if active and st.session_state.paused:
         st.warning("Wstrzymano — kliknij Wznów, aby kontynuować.")
-    elif st.session_state.running:
-        products = st.session_state.job_products
-        idx = st.session_state.job_index
-        if products and idx < len(products):
-            st.info(f"Sprawdzam: `{products[idx].ean}`")
-        elif st.session_state.current_ean:
+    elif active:
+        if st.session_state.current_ean:
             st.info(f"Sprawdzam: `{st.session_state.current_ean}`")
+        elif phase == "cache_lookup":
+            st.info("Trwa odczyt cache — postęp pojawi się za chwilę.")
 
     results = st.session_state.results
     if results:
@@ -993,8 +1102,8 @@ def results_section():
         st.success(f"Ostatni autozapis: `{st.session_state.last_autosave_path}`")
 
     st.caption(
-        "Autozapis po zakończeniu scrapowania: `data/output/` "
-        "(`results_DATA_szukanie_po_kodzie|nazwie.json`). "
+        "W trakcie joba: `results_partial_szukanie_po_*.json` (co 100). "
+        "Na końcu: timestampowany `results_DATA_szukanie_po_*.json`. "
         "Ręczne zapisywanie nadal dostępne."
     )
 
@@ -1222,136 +1331,236 @@ def analyze_section():
         )
 
 
-def _autosave_and_notify() -> None:
-    """Zapisuje results z suffixem trybu szukania po zakończeniu joba."""
-    from src.core.results_io import autosave_results
+def _reconcile_job_status() -> dict:
+    """Odczyt statusu; czyści martwy status po restarcie Streamlit."""
+    status = read_status()
+    if is_stale_running(status):
+        # Worker padł — zachowaj progress/total, żeby można było wznowić z cache
+        write_status(
+            running=False,
+            paused=False,
+            pause_requested=False,
+            phase="interrupted",
+            error="Proces joba został przerwany (crash / zamknięcie komputera).",
+        )
+        return read_status()
+    return status
 
-    results = st.session_state.results or []
-    if not results:
-        return
-    mode = "name" if st.session_state.search_mode == "Nazwa" else "code"
-    stamped = autosave_results(results, search_mode=mode)
-    st.session_state.last_autosave_path = str(stamped)
-    st.success(
-        f"Zakończono — sprawdzono {len(results)} produktów. "
-        f"Autozapis: `{stamped}`."
+
+def _finalize_job_ui(*, err_msg: str | None = None) -> None:
+    """
+    Po zakończeniu wątku: pokaż ścieżkę final/partial (zapis już zrobił worker).
+    Nie ładuje całych wyników do session_state (przy 10k+ to zabijało Streamlit).
+    """
+    status = read_status()
+    mode = status.get("search_mode") or (
+        "name" if st.session_state.search_mode == "Nazwa" else "code"
+    )
+    progress = int(status.get("progress") or 0)
+    final_path = status.get("final_path")
+    partial = status.get("partial_path") or str(partial_results_path(mode))
+
+    if final_path and Path(str(final_path)).exists():
+        st.session_state.last_autosave_path = str(final_path)
+        st.success(
+            f"Zakończono — sprawdzono {progress} produktów. "
+            f"Autozapis: `{final_path}`."
+        )
+    elif Path(partial).exists():
+        # Awaryjnie: worker nie zdążył final — dopisz timestamp z partial
+        try:
+            products = load_results_json(Path(partial))
+            if products:
+                stamped = autosave_results(products, search_mode=mode)
+                st.session_state.last_autosave_path = str(stamped)
+                st.success(
+                    f"Zakończono — sprawdzono {len(products)} produktów. "
+                    f"Autozapis z partial: `{stamped}`."
+                )
+            else:
+                st.warning("Job zakończony, ale plik partial jest pusty.")
+        except Exception as exc:
+            st.warning(f"Job zakończony; nie udało się odczytać partial: {exc}")
+    else:
+        st.warning("Job zakończony, ale brak pliku wyników.")
+
+    st.info(
+        "Duże wyniki otwórz w zakładce **Analiza wyników** (plik z `data/output/`), "
+        "żeby nie obciążać sesji Streamlit."
     )
 
+    if err_msg:
+        st.error(f"Błąd scrapowania: {err_msg}")
+    err = status.get("error")
+    if err and not err_msg:
+        st.error(f"Błąd joba: {err}")
 
-def _stop_job() -> None:
-    """Zatrzymuje bieżące zadanie i czyści kolejkę."""
+    total = int(status.get("total") or 0)
+    if total and progress < total and JOB_INPUT_PATH.exists():
+        # Job niepełny (Stop / crash) — zostaw status, UI zaproponuje wznowienie
+        write_status(
+            running=False,
+            paused=False,
+            pause_requested=False,
+            stop_requested=False,
+            phase="interrupted",
+        )
+    else:
+        clear_status()
+    st.session_state.results = []
     st.session_state.running = False
     st.session_state.paused = False
     st.session_state.current_ean = None
-    st.session_state.job_products = []
-    st.session_state.job_index = 0
     st.session_state.job_finished = True
-    processor = st.session_state.processor
-    if processor is not None:
-        processor.stop()
+    st.session_state.awaiting_external_job = False
+    st.session_state.job_result_queue = None
+    refresh_credits_info()
+
+
+def _stop_job() -> None:
+    """Sygnalizuje stop workerowi przez plik; UI dalej polluje status."""
+    request_pause(False)
+    request_stop()
+    st.session_state.paused = False
+    st.session_state.awaiting_external_job = True
 
 
 def _start_background_job(products: list[InputProduct], max_workers: int) -> None:
-    """Uruchamia cache bulk + równoległy scrape w wątku tła."""
+    """Uruchamia job w osobnym procesie (worker) — niezależnym od sesji Streamlit."""
     processor: ProductProcessor = st.session_state.processor
-    processor.config = st.session_state.config
-    result_q: queue.Queue = queue.Queue()
-    st.session_state.job_result_queue = result_q
-    st.session_state.job_finished = False
+    mode = processor.search_mode
     st.session_state.job_workers = max_workers
+    input_path = write_job_input(
+        products,
+        search_mode=mode,
+        config=st.session_state.config,
+        workers=max_workers,
+        render=bool(st.session_state.get("use_render", False)),
+    )
+    _launch_worker(input_path, total=len(products), mode=mode)
 
-    def _on_progress(current: int, total: int, result: ProductResult) -> None:
-        result_q.put(
-            {
-                "type": "result",
-                "current": current,
-                "total": total,
-                "ean": result.ean,
-                "result": result.to_dict(),
-            }
-        )
 
-    def _run() -> None:
-        try:
-            processor.process_batch(
-                products,
-                progress_callback=_on_progress,
-                max_workers=max_workers,
-            )
-        except Exception as exc:
-            result_q.put({"type": "error", "message": str(exc)})
-        finally:
-            result_q.put({"type": "done"})
-
-    thread = threading.Thread(target=_run, name="scrape-job", daemon=True)
-    st.session_state.job_thread = thread
-    thread.start()
+def _launch_worker(input_path: Path, *, total: int, mode: str) -> None:
+    """Zapisuje startowy status i uruchamia worker na podanym job_input.json."""
+    st.session_state.job_finished = False
+    st.session_state.awaiting_external_job = True
+    st.session_state.running = False
+    st.session_state.last_partial_reload_at = 0
+    # Status zapisujemy przed spawnem, żeby UI od razu widział job (bez luki)
+    write_status(
+        running=True,
+        paused=False,
+        stop_requested=False,
+        pause_requested=False,
+        progress=0,
+        total=total,
+        cache_hits=0,
+        scraped=0,
+        current_ean=None,
+        search_mode=mode,
+        partial_path=str(partial_results_path(mode)),
+        final_path=None,
+        phase="cache_lookup",
+        started_at=datetime.now().isoformat(),
+        error=None,
+        pid=os.getpid(),  # tymczasowo (żyjący proces), nadpisane PID-em workera
+    )
+    proc = spawn_worker(input_path)
+    write_status(pid=proc.pid)
 
 
 def process_job_tick() -> None:
     """
-    Odbiera wyniki z wątku tła (cache + parallel) i odświeża UI.
+    Synchronizuje UI z job_status.json (źródło prawdy). Job działa w osobnym
+    procesie (worker), więc po F5 / rozłączeniu UI wystarczy ponownie odczytać status.
     """
-    if not st.session_state.running:
+    status = _reconcile_job_status()
+    disk_running = bool(status.get("running"))
+
+    if disk_running:
+        st.session_state.awaiting_external_job = True
+
+    if not disk_running and not st.session_state.awaiting_external_job:
         return
 
-    result_q = st.session_state.get("job_result_queue")
-    if result_q is None:
-        return
+    st.session_state.progress = int(status.get("progress") or 0)
+    if status.get("total"):
+        st.session_state.total = int(status["total"])
+    if status.get("current_ean"):
+        st.session_state.current_ean = status.get("current_ean")
+    st.session_state.paused = bool(status.get("paused") or status.get("pause_requested"))
 
-    drained = 0
-    finished = False
-    err_msg = None
-    while True:
-        try:
-            item = result_q.get_nowait()
-        except queue.Empty:
-            break
-        drained += 1
-        kind = item.get("type")
-        if kind == "result":
-            st.session_state.results.append(item["result"])
-            st.session_state.progress = item["current"]
-            st.session_state.job_index = item["current"]
-            st.session_state.current_ean = item.get("ean")
-        elif kind == "error":
-            err_msg = item.get("message") or "Błąd joba"
-        elif kind == "done":
-            finished = True
+    # NIE ładuj partial do session_state w trakcie joba — przy 10k+ zabija Streamlit.
 
-    if err_msg:
-        st.error(f"Błąd scrapowania: {err_msg}")
-
-    if finished:
-        st.session_state.running = False
-        st.session_state.paused = False
-        st.session_state.current_ean = None
-        st.session_state.job_finished = True
-        refresh_credits_info()
-        _autosave_and_notify()
+    if st.session_state.awaiting_external_job and not disk_running:
+        _finalize_job_ui(err_msg=status.get("error"))
         st.rerun()
         return
 
-    if st.session_state.paused:
-        return
-
-    # Krótki poll — bez sleep(6) między produktami
-    time.sleep(0.25 if drained else 0.4)
+    time.sleep(1.0)
     st.rerun()
+
+
+
+def _resume_panel(status: dict) -> None:
+    """Panel wznowienia przerwanego joba (Stop / crash workera)."""
+    if status.get("running") or status.get("phase") != "interrupted":
+        return
+    if not JOB_INPUT_PATH.exists():
+        clear_status()
+        return
+    progress = int(status.get("progress") or 0)
+    total = int(status.get("total") or 0)
+    st.warning(
+        f"Przerwany job: {progress} / {total}. "
+        "Wznowienie pominie wszystko, co już jest w cache (bez zużycia kredytów) "
+        "i dokończy brakujące."
+    )
+    if status.get("error"):
+        st.caption(str(status["error"]))
+    c1, c2 = st.columns(2)
+    if c1.button("▶️ Wznów przerwany job", key="resume_job_btn"):
+        try:
+            payload = json.loads(JOB_INPUT_PATH.read_text(encoding="utf-8"))
+            total = len(payload.get("products", []))
+            mode = payload.get("search_mode", "code")
+        except (OSError, json.JSONDecodeError) as exc:
+            st.error(f"Nie można odczytać `{JOB_INPUT_PATH}`: {exc}")
+            return
+        _launch_worker(JOB_INPUT_PATH, total=total, mode=mode)
+        st.rerun()
+    if c2.button("🗑️ Odrzuć", key="discard_job_btn"):
+        clear_status()
+        st.rerun()
 
 
 def scrape_tab() -> None:
     """Zawartość zakładki Scrapowanie."""
+    if st.session_state.job_status_banner:
+        st.warning(st.session_state.job_status_banner)
+        st.session_state.job_status_banner = None
+
+    # Po refresh: podepnij UI do joba z dysku (tylko liczniki — bez ładowania JSON)
+    status = _reconcile_job_status()
+    if status.get("running"):
+        st.session_state.awaiting_external_job = True
+        st.session_state.progress = int(status.get("progress") or 0)
+        st.session_state.total = int(status.get("total") or 0)
+        st.session_state.current_ean = status.get("current_ean")
+
+    _resume_panel(status)
+
     df = upload_section()
 
     can_start = True
     selected_df = None
+    job_active = _job_is_active()
     st.segmented_control(
         "Szukaj po",
         options=["Kod", "Nazwa"],
         key="search_mode",
         selection_mode="single",
-        disabled=bool(st.session_state.running),
+        disabled=job_active,
         help="Kod = fraza to kod produktu. Nazwa = fraza zbudowana z kolumny `nazwa`. "
         "Brak zaznaczenia = Kod.",
     )
@@ -1364,7 +1573,7 @@ def scrape_tab() -> None:
 
     if df is not None and len(df) > 0:
         selected_df = range_section(df)
-        can_start = cost_estimate_section(len(selected_df))
+        can_start = cost_estimate_section(selected_df, by_name)
         if by_name:
             has_name_col = any(str(c).strip().lower() in ("nazwa", "name") for c in df.columns)
             if not has_name_col:
@@ -1373,7 +1582,9 @@ def scrape_tab() -> None:
 
     start_btn, pause_btn, resume_btn, stop_btn = control_section()
 
-    if start_btn and selected_df is not None and can_start:
+    if start_btn and job_active:
+        st.warning("Job już trwa — poczekaj na koniec albo kliknij Stop.")
+    elif start_btn and selected_df is not None and can_start:
         products = df_to_input_products(selected_df)
         if by_name:
             skipped = sum(1 for p in products if not (p.name or "").strip())
@@ -1399,7 +1610,6 @@ def scrape_tab() -> None:
                 st.session_state.progress = 0
                 st.session_state.current_ean = None
                 st.session_state.paused = False
-                st.session_state.running = True
                 st.session_state.selected_df = selected_df
                 st.session_state.last_autosave_path = None
                 refresh_credits_info()
@@ -1424,24 +1634,23 @@ def scrape_tab() -> None:
     elif start_btn and selected_df is None:
         st.error("Najpierw wczytaj plik CSV.")
     elif start_btn and not can_start:
-        st.error("Nie można rozpocząć - za mało kredytów na wybrany zakres!")
+        st.error(
+            "Nie można rozpocząć - za mało kredytów na braki w zakresie. "
+            "Zmniejsz zakres albo zaznacz potwierdzenie „Rozumiem ryzyko”."
+        )
 
-    if pause_btn and st.session_state.running:
+    if pause_btn and job_active:
+        request_pause(True)
         st.session_state.paused = True
-        processor = st.session_state.processor
-        if processor is not None:
-            processor.pause()
 
-    if resume_btn and st.session_state.running and st.session_state.paused:
+    if resume_btn and job_active:
+        request_pause(False)
         st.session_state.paused = False
-        processor = st.session_state.processor
-        if processor is not None:
-            processor.resume()
         st.rerun()
 
     if stop_btn:
         _stop_job()
-        st.warning("Zatrzymano")
+        st.warning("Zatrzymywanie joba…")
 
     progress_section()
     results_section()
