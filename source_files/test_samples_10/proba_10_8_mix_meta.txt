@@ -1,0 +1,12 @@
+Mix 10 #8: 3 HOT + 3 MID + 2 FEW + 2 ZERO. Bez powtórzeń względem wcześniejszych proba_10_*.
+
+[HOT] 62042RSC3SKF; ofert=6; max_buyers=59; match=100; Łożysko kulkowe zwykłe 20x47x14 mm SKF 62042RSC3SK; lider=Łożysko kulkowe zwykłe 20x47x14 mm SKF 62042RSC3SKF
+[HOT] 17001870049; ofert=2; max_buyers=47; match=100; Łopata do zboża Rolplas; lider=17001870049 Łopata do zboża Rolplas
+[HOT] U02250; ofert=3; max_buyers=191; match=100; Pług dwusekcyjny  półzawieszany obrotowy Vari Tita; lider=ZABAWKA BRUDER CIĄGNIK NEW HOLLAND U03120 + PŁUG LEMKEN U02250 – ZESTAW
+[MID] 3256015701; ofert=4; max_buyers=18; match=100; Rolka napinająca; lider=Rolka zwrotna do napędu jezdnego Castel Garden 3256015701 256015700
+[MID] 11434001203; ofert=11; max_buyers=17; match=100; Koło zamachowe; lider=Koło magnesowe do piły STIHL MS231 MS251 11434001201 11434001203
+[MID] 71704537; ofert=2; max_buyers=12; match=100; Koło zębate Z-55; lider=Koło zębate Z-55 71704537
+[FEW] D10ACIDE024; ofert=2; max_buyers=1; match=100; Kwaśny środek do urządzeń udojowych  2.4 kg; lider=D10 ACIDE - Kwaśny środek myjąco-odkamieniający do urządzeń udo D10ACIDE024
+[FEW] 1134505204; ofert=3; max_buyers=4; match=100; Wał noża/uchwyt 131.5 mm; lider=Wałek noża kosiarki Stiga Park 92M Ready 92M Villa 92M 1134505204
+[ZERO] 85011403222; ofert=1; max_buyers=0; match=99; Pas klinowy Gates  1403222; lider=-
+[ZERO] OR193P025; ofert=1; max_buyers=0; match=99; Pierścień uszczelniający o-ring 19x3mm 25 szt. Kra; lider=-
