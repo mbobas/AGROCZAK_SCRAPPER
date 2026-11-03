@@ -134,13 +134,15 @@ def offer_stats(
         except (TypeError, ValueError):
             continue
 
-    cheapest = None
-    if offers and prices:
-        cheapest = min(
-            (o for o in offers if float(o.get("price") or 0) > 0),
-            key=lambda o: float(o.get("price") or 0),
-            default=None,
-        )
+    priced = [o for o in offers if _offer_price(o) > 0]
+    cheapest = min(priced, key=_offer_price) if priced else None
+
+    sold = [
+        o
+        for o in offers
+        if _offer_buyers(o) is not None and _offer_buyers(o) >= 1
+    ]
+    leader = max(sold, key=_offer_buyers) if sold else None
 
     min_price = min(prices) if prices else None
     max_price = max(prices) if prices else None
@@ -171,11 +173,35 @@ def offer_stats(
         "max_price": max_price,
         "cheapest_title": (cheapest or {}).get("title") if cheapest else None,
         "cheapest_price": float(cheapest["price"]) if cheapest else None,
+        "leader_title": (leader or {}).get("title") if leader else None,
+        "leader_price": _offer_price(leader) if leader else None,
+        "leader_buyers": _offer_buyers(leader) if leader else None,
         "markup_min_pct": markup_min,
         "matching_count": len(matching),
         "matching_offers": matching,
         "best_match_pct": best_match_pct,
     }
+
+
+def _offer_price(offer: Optional[Dict[str, Any]]) -> float:
+    if not offer:
+        return 0.0
+    try:
+        return float(offer.get("price") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _offer_buyers(offer: Optional[Dict[str, Any]]) -> Optional[int]:
+    if not offer:
+        return None
+    buyers = offer.get("buyers_count")
+    if buyers is None:
+        return None
+    try:
+        return int(buyers)
+    except (TypeError, ValueError):
+        return None
 
 
 def format_status(status: Optional[str]) -> str:
@@ -215,7 +241,10 @@ def summary_row(
         "Liczba ofert": stats["offers_count"],
         "Cena min": stats["min_price"],
         "Cena max": stats["max_price"],
-        "Najtańsza oferta": stats["cheapest_title"],
+        "Tytuł najtańszej": stats["cheapest_title"],
+        "Kupujących max": stats["leader_buyers"],
+        "Cena lidera": stats["leader_price"],
+        "Tytuł lidera": stats["leader_title"],
         "Marża min %": stats["markup_min_pct"],
         "Dopasowanie max %": stats["best_match_pct"],
         "Pasujące": stats["matching_count"],

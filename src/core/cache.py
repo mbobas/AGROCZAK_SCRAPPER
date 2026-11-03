@@ -185,6 +185,26 @@ class ProductCache:
                 conn.commit()
                 return cursor.rowcount
 
+    def delete_keys(self, keys: List[str]) -> int:
+        """Usuwa wskazane klucze; reszta cache zostaje. Zwraca liczbę usuniętych."""
+        unique = [k for k in dict.fromkeys(keys) if k]
+        if not unique:
+            return 0
+        deleted = 0
+        chunk_size = 400
+        with self._lock:
+            with self._connect() as conn:
+                for i in range(0, len(unique), chunk_size):
+                    chunk = unique[i : i + chunk_size]
+                    placeholders = ",".join("?" * len(chunk))
+                    cursor = conn.execute(
+                        f"DELETE FROM products WHERE ean IN ({placeholders})",
+                        chunk,
+                    )
+                    deleted += cursor.rowcount
+                conn.commit()
+        return deleted
+
     def clear_all(self):
         """Czysci caly cache."""
         with self._lock:

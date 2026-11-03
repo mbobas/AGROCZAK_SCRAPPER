@@ -983,9 +983,17 @@ def results_columns_help(*, key: str = "results_columns_help") -> None:
 - ❌ **error** — błąd zapytania (API, scrape.do, sieć); treść w kolumnie **Błąd**.
 - ⏳ **pending** — jeszcze nie sprawdzone.
 
-**Pasujące** — liczone na żywo wg filtrów (sidebar): marża min–max względem Twojej ceny
-oraz min. kupujących. Przy domyślnych 0–50% i min. kupujących = 0 zwykle = wszystkie oferty.
-Gdy zacieśnisz filtry, liczba spada. Min. kupujących = 0 → oferty bez `buyers_count` też liczą się.
+**Pasujące** — liczone na żywo wg filtrów: marża, min. kupujących, min. dopasowanie.
+W Analizie domyślnie: bez limitu marży, min. 1 kupujący, dopasowanie ≥ 90% (kod w tytule).
+Puste `buyers_count` = brak etykiety na listingu (nie mylić z zerem sprzedaży).
+
+**Kupujących max / Cena lidera / Tytuł lidera** — oferta z największą liczbą kupujących
+po filtrach. To jest cena, która się sprzedaje — nie mylić z najtańszą.
+Liczba z listingu to zwykle „N osób kupiło ostatnio” (produkt u wielu sprzedających,
+ok. 30 dni), nie zawsze sprzedaż tej jednej karty oferty.
+
+**Cena min / Tytuł najtańszej** — najniższa cena wśród ofert po filtrach
+(lider sprzedaży może być droższy).
 
 **Błąd** — puste = OK. Komunikat tylko przy statusie error.
 
@@ -1198,7 +1206,7 @@ def analyze_section():
         markup_range = st.select_slider(
             "Zakres marży % (względem mojej ceny)",
             options=list(range(-110, 111)),
-            value=(0, 50),
+            value=(-110, 110),
             format_func=lambda v: (
                 "-∞" if v <= -110 else "+∞" if v >= 110 else f"{v}%"
             ),
@@ -1222,11 +1230,11 @@ def analyze_section():
             "Min. kupujących",
             min_value=0,
             max_value=1000,
-            value=0,
+            value=1,
             key="analyze_min_buyers",
             help=(
-                "0 = bez filtra (oferty bez danych o kupujących też są widoczne). "
-                "Od 1 w górę ukrywa oferty poniżej progu oraz oferty bez danych."
+                "Domyślnie 1 — tylko oferty z etykietą sprzedaży. "
+                "0 = bez filtra (oferty bez danych o kupujących też są widoczne)."
             ),
         )
 
@@ -1235,7 +1243,7 @@ def analyze_section():
         "Min. dopasowanie nazwy (%)",
         min_value=0,
         max_value=100,
-        value=0,
+        value=90,
         step=5,
         key="analyze_min_match",
         disabled=not has_names,
@@ -1284,7 +1292,7 @@ def analyze_section():
     st.dataframe(summary_df, width="stretch")
 
     flat = flatten_offers(filtered, **offer_filters)
-    with st.expander(f"Oferty spłaszczone ({len(flat)})", expanded=True):
+    with st.expander(f"Wszytkie oferty ({len(flat)})", expanded=True):
         if flat:
             st.dataframe(pd.DataFrame(flat), width="stretch")
         else:
@@ -1314,7 +1322,7 @@ def analyze_section():
                 "text/csv",
                 key="analyze_download_csv",
                 help=(
-                    "Pobiera tabelę „Oferty spłaszczone”: jedna oferta = jeden wiersz, "
+                    "Pobiera tabelę „Wszytkie oferty”: jedna oferta = jeden wiersz, "
                     "tylko oferty spełniające bieżące filtry (marża, kupujący, dopasowanie)."
                 ),
             )

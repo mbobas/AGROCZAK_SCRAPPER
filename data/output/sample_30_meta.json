@@ -1,0 +1,44 @@
+{
+  "groups": {
+    "worst": [
+      "GRAE40NPPB",
+      "SPB2900",
+      "SPB2850",
+      "CD450",
+      "SPB3650",
+      "SPA907",
+      "173460",
+      "SPC2240",
+      "8PK1480",
+      "SPB4750"
+    ],
+    "sold": [
+      "UCF207",
+      "UCP206",
+      "30206",
+      "UCP207",
+      "UCF209",
+      "UCF208",
+      "UCFL207",
+      "32207",
+      "125A10",
+      "30206A"
+    ],
+    "random": [
+      "KF1966302044",
+      "80916",
+      "2919",
+      "603012FA",
+      "25527CCP001",
+      "60103504N",
+      "8JS742902091",
+      "CH14642",
+      "18262",
+      "1850489"
+    ]
+  },
+  "missing_in_json": [],
+  "count": 30,
+  "json": "D:\\AAA_CODE_22\\PRIV\\PZ\\AGROCZAK_SCRAPPER\\data\\output\\results_sample_30_szukanie_po_kodzie.json",
+  "note": "Wczytaj w Analizie: results_sample_30_szukanie_po_kodzie.json"
+}

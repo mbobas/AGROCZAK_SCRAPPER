@@ -13,9 +13,15 @@ venv/
 # Dane wyjściowe i cache
 # data/output/
 data/cache.db
+data/cache.db.bak*
+data/*.db
+data/*.db.bak*
 data/job_status.json
 data/logs/
 *.log
+
+# Za duże na GitHub (>50–100 MB) — trzymaj lokalnie
+data/przyklady_zly_outputow/oferty_200k.csv
 
 # IDE
 .idea/

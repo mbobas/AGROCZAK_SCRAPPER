@@ -2,17 +2,16 @@
 
 Aplikacja do monitorowania cen i sprzedaży produktów na Allegro na podstawie kodów EAN.
 
+Historia zmian: [CHANGELOG.md](CHANGELOG.md).
+
 ## Funkcje
 
-- Wyszukiwanie produktów po kodzie EAN
-- Sprawdzanie cen na Allegro
-- Informacja o sprzedaży ("X osób kupiło")
-- Filtrowanie po marży cenowej (np. 12-15%)
-- Dopasowanie oferty: 100% = kod w tytule + słowo z nazwy; 90% = sam kod; sama nazwa max 99%; legenda nad wynikami
-- Analiza wyników: filtry (marża z końcami -∞/+∞, min. kupujących, dopasowanie nazwy) działają na poziomie ofert; min. kupujących = 0 przepuszcza oferty bez danych, od 1 je ukrywa
-- Cache wyników (SQLite)
-- Tryb konsolowy i GUI (Streamlit)
-- Śledzenie zużycia kredytów scrape.do
+- Wyszukiwanie po kodzie produktu lub nazwie (scrape.do → listing Allegro)
+- Cena oferty z listingu; sprzedaż z etykiety **„N osób kupiło ostatnio”** (popularność **produktu**, ~30 dni, wielu sprzedawców — nie zawsze „kupiło tę ofertę”)
+- JSON ze scrapu = **pełny listing**. Cięcie pod klienta jest w **Analizie wyników** (lokalnie, 0 kredytów)
+- Dopasowanie: **100%** = kod w tytule + słowo z nazwy; **90%** = sam kod; sama nazwa max **99%**
+- Analiza (domyślnie od 2026-10-30): min. **1 kupujący**, dopasowanie **≥ 90%**, marża **bez limitu**. Kolumny **Cena lidera / Kupujących max / Tytuł lidera** vs **Cena min / Tytuł najtańszej**
+- Cache SQLite (`data/cache.db`); GUI Streamlit + CLI; zużycie kredytów scrape.do
 
 ## Wymagania
 
@@ -62,19 +61,7 @@ cp .env.example .env
 SCRAPE_DO_TOKEN=twoj_token_z_scrape_do
 ```
 
-3. (Opcjonalnie) Dostosuj `config.yaml`:
-
-```yaml
-price_threshold:
-  min_markup: 0.12  # 12%
-  max_markup: 0.15  # 15%
-
-sales_threshold:
-  min_buyers: 1     # minimum "X osób kupiło"
-
-cache:
-  ttl_days: 30      # ważność danych w dniach
-```
+3. (Opcjonalnie) Dostosuj `config.yaml`. Progi przy **scrapie** zbierają szeroko (`min_buyers: 0`, marża 0–50% tylko do `matching_offers` w JSON). **Filtry dla Piotra ustawiaj w Analizie**, nie tu.
 
 ## Użycie
 
@@ -98,7 +85,15 @@ python src/main.py cache clear-expired
 streamlit run src/gui/dashboard.py
 ```
 
-Otworzy się przeglądarka z interfejsem na `http://localhost:8501`
+Otworzy się przeglądarka z interfejsem na `http://localhost:8501`.
+
+**Scrapowanie** — sidebar (marża, min. kupujących) dotyczy **kolejnego joba**, nie tabeli Analizy.
+
+**Analiza wyników** — wczytaj `results_*.json` z `data/output` (albo Upload). Domyślne filtry: kupujący ≥ 1, match ≥ 90%, marża −∞…+∞. CSV podsumowania i ofert spłaszczonych idzie z tych filtrów.
+
+Nie mylić z diagnostyką: `data/logs/diagnose/` **nie** pojawia się na liście Analizy.
+
+Próbka 30 kodów (przed/po scrapie, do ręcznego porównania): `data/output/results_sample_30_szukanie_po_kodzie.json`, `sample_30_after_listing.json`, `sample_30_compare.csv`. Szczegóły w changelogu.
 
 ## Deploy (Streamlit Cloud)
 
@@ -121,12 +116,9 @@ ean;cena;nazwa
 
 Obsługiwany jest też format `Kod produktu;nazwa;brutto` (nazwa opcjonalna).
 
-Gdy podana jest nazwa, w analizie wyników liczone jest **dopasowanie %**: udział
-znaczących słów z nazwy znalezionych w tytule oferty Allegro (np. 3 z 4 słów = 75%).
-W zakładce „Analiza wyników” można filtrować suwakiem „Min. dopasowanie nazwy”.
-Jeśli tytuł oferty zawiera cały kod produktu (np. `SW-378311` = `SW378311`; kod min. 5 znaków z cyfrą),
-dopasowanie to automatycznie 100% (kolumna „Powód” = `kod`).
-Liczone lokalnie, bez dodatkowych kredytów.
+Gdy jest nazwa, **dopasowanie %** = udział znaczących słów z nazwy w tytule oferty.
+Kod w tytule (np. `SW-378311` = `SW378311`, min. 5 znaków z cyfrą) + słowo z nazwy → 100% (`kod+nazwa`); sam kod → 90% (`tylko kod`).
+Liczone lokalnie, bez kredytów.
 
 Kolumny:
 - `Kod produktu` / `ean` / `EAN` / `kod` / `code` - kod produktu (wymagane)
@@ -149,6 +141,17 @@ Aplikacja scrapuje **równolegle** do limitu **Concurrent Requests** z planu
 (np. Hobby = **10**). Cache: bulk odczyt, bez delay — ponowne kody w TTL ≈ 0 kred.
 
 Szacunek: 16 000 kodów × 10 ≈ **160 000** kredytów (pierwszy przebieg, render OFF).
+Pełne ponowne scrapowanie 16k na koncie ~1000 kr. **nie ma sensu** — filtruj istniejący JSON w Analizie.
+
+Karta pojedynczej oferty (`/oferta/{id}`) to kolejne ~10 kr. i ma sens tylko przy match 100%, z limitem (patrz próbka 30 w changelogu).
+
+### Cache
+
+- Plik: `data/cache.db`. Przycisk „Wyczyść cache” w GUI kasuje **wszystko**.
+- Kopie (przywrócenie = skopiuj bak na `cache.db` przy wyłączonym scrapie):
+  - `data/cache.db.bak_20261030_1755`
+  - `data/cache.db.bak_20261030_2004` (16 811, z odświeżoną trzydziestką)
+- Hit w TTL = 0 kredytów; po `cache clear` te same kody idą znów na scrape.do.
 
 ### Tryb wyszukiwania (Kod / Nazwa)
 
@@ -170,14 +173,18 @@ AGROCZAK_SCRAPPER/
 │   │   ├── allegro.py     # Klient API Allegro
 │   │   └── scraper.py     # scrape.do + parser HTML
 │   ├── core/
-│   │   ├── processor.py   # Logika przetwarzania
-│   │   └── cache.py       # Cache wyników (SQLite)
+│   │   ├── processor.py   # Job scrapu
+│   │   ├── results_io.py  # Filtry Analizy, CSV, lider sprzedaży
+│   │   ├── matching.py    # Dopasowanie kod/nazwa
+│   │   └── cache.py       # SQLite
 │   └── gui/
-│       └── dashboard.py   # Interfejs Streamlit
+│       └── dashboard.py
 ├── data/
-│   ├── input/             # Pliki wejściowe
-│   └── output/            # Wyniki
-└── tests/                 # Testy
+│   ├── cache.db           # Cache (nie commituj bak-ów z danymi klienta jeśli nie trzeba)
+│   ├── output/            # results_*.json, próbka 30, verify_*.csv
+│   └── logs/diagnose/     # HTML/JSON diagnostyki (nie lista Analizy)
+├── CHANGELOG.md
+└── tests/                 # m.in. build_sample_30, rescrape_sample_30
 ```
 
 ## Rozwiązywanie problemów

@@ -303,6 +303,53 @@ def _extract_listing_store_state(html: str) -> tuple[list, dict]:
     return elements, meta
 
 
+_BUYERS_RE = re.compile(
+    r"(\d+)\s*os[oó]b",
+    re.IGNORECASE,
+)
+
+
+def _texts_from_popularity(blob: Any) -> List[str]:
+    """Zbiera napisy z productPopularity / popularity (label, tooltip, labelParts)."""
+    texts: List[str] = []
+    if not isinstance(blob, dict):
+        return texts
+    for key in ("label", "tooltip"):
+        val = blob.get(key)
+        if val:
+            texts.append(str(val))
+    for lab in blob.get("labels") or []:
+        if isinstance(lab, str):
+            texts.append(lab)
+            continue
+        if not isinstance(lab, dict):
+            continue
+        for part in lab.get("labelParts") or []:
+            if isinstance(part, dict) and part.get("text"):
+                texts.append(str(part["text"]))
+            elif isinstance(part, str):
+                texts.append(part)
+    return texts
+
+
+def _buyers_count_from_listing_item(item: dict) -> Optional[int]:
+    """
+    Liczba z etykiety listingu („N osób kupiło ostatnio”).
+    Na listingu Allegro to popularność *produktu* (wiele ofert, ~30 dni),
+    nie „kupiło tę konkretną ofertę”. Lepszej liczby w JSON listingu nie ma.
+    """
+    chunks: List[str] = []
+    for key in ("productPopularity", "popularity"):
+        chunks.extend(_texts_from_popularity(item.get(key)))
+    blob = " ".join(chunks)
+    if not blob.strip():
+        return None
+    match = _BUYERS_RE.search(blob)
+    if match:
+        return int(match.group(1))
+    return None
+
+
 def _offer_from_listing_item(item: dict) -> Optional[OfferData]:
     """Mapuje jeden element listingu Allegro na OfferData."""
     try:
@@ -352,14 +399,7 @@ def _offer_from_listing_item(item: dict) -> Optional[OfferData]:
         elif not url.startswith("http"):
             url = "https://allegro.pl" + url
 
-        buyers_count = None
-        popularity = item.get("productPopularity") or item.get("popularity", {})
-        if isinstance(popularity, dict):
-            label = popularity.get("label", "")
-            if label:
-                num_match = re.search(r"(\d+)", str(label))
-                if num_match:
-                    buyers_count = int(num_match.group(1))
+        buyers_count = _buyers_count_from_listing_item(item)
 
         seller = item.get("seller", {})
         seller_name = seller.get("login", "") if isinstance(seller, dict) else None
@@ -469,7 +509,7 @@ parse_allegro_search_html.last_meta = {}  # type: ignore[attr-defined]
 def parse_allegro_offer_html(html: str) -> Optional[OfferData]:
     """
     Parsuje HTML strony pojedynczej oferty Allegro.
-    Wyciaga: tytul, cene, sprzedawce, "X osob kupilo".
+    Preferuje „X osób kupiło tę ofertę” nad popularnością produktu na listingu.
     """
     offer_data = {
         "offer_id": None,
@@ -481,43 +521,95 @@ def parse_allegro_offer_html(html: str) -> Optional[OfferData]:
         "url": None,
         "is_smart": False,
     }
-    
-    # Tytul - zwykle w <h1>
-    title_match = re.search(r'<h1[^>]*>([^<]+)</h1>', html)
+
+    title_match = re.search(r"<h1[^>]*>([^<]+)</h1>", html)
     if title_match:
         offer_data["title"] = title_match.group(1).strip()
-    
-    # Cena - szukamy wzorca z formatem "123,99 zł"
-    price_match = re.search(r'(\d+[\s,]?\d*)\s*zł', html)
-    if price_match:
-        price_str = price_match.group(1).replace(" ", "").replace(",", ".")
+
+    for ld in re.finditer(
+        r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>',
+        html,
+        re.DOTALL | re.IGNORECASE,
+    ):
         try:
-            offer_data["price"] = float(price_str)
-        except ValueError:
-            pass
-    
-    # "X osob kupilo te oferte" - kluczowa informacja
-    buyers_match = re.search(r'(\d+)\s*os[oó]b[ay]?\s*kupi[łl][oayi]', html, re.IGNORECASE)
-    if buyers_match:
-        offer_data["buyers_count"] = int(buyers_match.group(1))
-    
-    # Smart! badge
+            data = json.loads(ld.group(1))
+        except json.JSONDecodeError:
+            continue
+        blobs = data if isinstance(data, list) else [data]
+        for blob in blobs:
+            if not isinstance(blob, dict):
+                continue
+            if not offer_data["title"] and blob.get("name"):
+                offer_data["title"] = str(blob.get("name")).strip()
+            offers = blob.get("offers")
+            if isinstance(offers, dict) and offers.get("price") and not offer_data["price"]:
+                try:
+                    offer_data["price"] = float(str(offers["price"]).replace(",", "."))
+                except (TypeError, ValueError):
+                    pass
+
+    if not offer_data["price"]:
+        price_match = re.search(r"(\d+[ \u00a0]?\d*[,\.]\d{2})\s*zł", html)
+        if not price_match:
+            price_match = re.search(r"(\d+[\s,]?\d*)\s*zł", html)
+        if price_match:
+            price_str = price_match.group(1).replace(" ", "").replace("\u00a0", "").replace(",", ".")
+            try:
+                offer_data["price"] = float(price_str)
+            except ValueError:
+                pass
+
+    buyers = None
+    this_offer = re.search(
+        r"(\d+)\s*os[oó]b[ay]?\s*kupi[łl][oayi]+\s*t[eę]",
+        html,
+        re.IGNORECASE,
+    )
+    if this_offer:
+        buyers = int(this_offer.group(1))
+    if buyers is None:
+        generic = re.search(
+            r"(\d+)\s*os[oó]b[ay]?\s*kupi[łl][oayi]",
+            html,
+            re.IGNORECASE,
+        )
+        if generic:
+            buyers = int(generic.group(1))
+    if buyers is None:
+        for key in ("soldCount", "buyersCount", "quantitySold", "sold"):
+            key_m = re.search(rf'"{key}"\s*:\s*"?(\d+)"?', html)
+            if key_m:
+                buyers = int(key_m.group(1))
+                break
+    offer_data["buyers_count"] = buyers
+
     if "SMART" in html or "smart" in html.lower():
         offer_data["is_smart"] = True
-    
-    # Sprzedawca - zwykle w sekcji "od [nazwa]"
-    seller_match = re.search(r'od\s+<[^>]+>([^<]+)</a>', html)
+
+    seller_match = re.search(r"od\s+<[^>]+>([^<]+)</a>", html)
     if seller_match:
         offer_data["seller_name"] = seller_match.group(1).strip()
-    
-    # Offer ID z URL
-    offer_id_match = re.search(r'/oferta/[^-]+-(\d+)', html)
+
+    offer_id_match = re.search(r"/oferta/[^\s\"']*?-(\d{8,})", html)
     if offer_id_match:
         offer_data["offer_id"] = offer_id_match.group(1)
-    
+
     if offer_data["title"] and offer_data["price"]:
         return OfferData(**offer_data)
-    
+
+    return None
+
+
+def offer_page_url(offer: Any) -> Optional[str]:
+    """URL karty oferty (/oferta/id), nie strony produktu."""
+    oid = str(getattr(offer, "offer_id", None) or (offer.get("offer_id") if isinstance(offer, dict) else "") or "").strip()
+    url = str(getattr(offer, "url", None) or (offer.get("url") if isinstance(offer, dict) else "") or "")
+    if "/oferta/" in url and "events/clicks" not in url:
+        if url.startswith("http"):
+            return url.split("?")[0]
+        return "https://allegro.pl" + url.split("?")[0]
+    if oid:
+        return f"https://allegro.pl/oferta/{oid}"
     return None
 
 
