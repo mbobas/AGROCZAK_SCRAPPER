@@ -1,0 +1,12 @@
+Kryteria: Liczba ofert 2–18 w podsumowanie_16k, max Kupujących >= 20 w oferty_200k, dopasowanie max >= 90%, preferencja kodu w tytule lidera.
+
+1066717; ofert=8; max_buyers=626; cena_lidera=108.0; lider=Szpadel prosty solid trzon metalowy Fiskars 1066717 mocny wytrzymały
+U02331; ofert=2; max_buyers=433; cena_lidera=56.75; lider=ZABAWKA BRUDER U02331 Pług obracalny LEMKEN 5 Skibowy
+VV9130; ofert=2; max_buyers=395; cena_lidera=16.99; lider=Poidło butelkowe dla królików Classic 600 ml VV9130
+1594010250; ofert=2; max_buyers=375; cena_lidera=92.45; lider=Granulat na myszy i szczury Bros, 2,5 kg 1594010250
+U02329; ofert=2; max_buyers=332; cena_lidera=53.0; lider=ZABAWKA BRUDER U02329 Kultywator talerzowy Lemken Smaragd
+15941632; ofert=3; max_buyers=327; cena_lidera=9.6; lider=Granulat na myszy i szczury, 140g 15941632
+U03333; ofert=2; max_buyers=305; cena_lidera=41.0; lider=Ładowacz czołowy do ciągników serii 1992-03 1:16 BRUDER U03333
+U02203; ofert=3; max_buyers=285; cena_lidera=145.0; lider=Przyczepa wywrotka z podwyższanymi burtami Bruder U02203
+1600Z00038; ofert=7; max_buyers=269; cena_lidera=320.83; lider=Bosch Professional GBA 18V 4.0Ah Akumulator XL COOLPACK 1600Z00038 (A)
+135715; ofert=15; max_buyers=266; cena_lidera=95.0; lider=FISKARS Grabie do liści trawy SOLID metalowe 14 zębów 135715 1016036 154 cm
